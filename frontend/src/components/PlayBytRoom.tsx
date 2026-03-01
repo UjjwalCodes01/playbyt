@@ -338,7 +338,7 @@ function RoomLayout({ config, commentary, addCommentary, onLeave }: RoomLayoutPr
           }
         }
       } catch { /* ignore */ }
-    }, 2000)
+    }, 5000)
     return () => clearInterval(poll)
   }, [])
 
@@ -376,7 +376,7 @@ function RoomLayout({ config, commentary, addCommentary, onLeave }: RoomLayoutPr
           setAgentStatus(data)
         }
       } catch { /* ignore */ }
-    }, 3000)
+    }, 5000)
     return () => clearInterval(poll)
   }, [])
 

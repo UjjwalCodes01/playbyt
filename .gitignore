@@ -16,6 +16,12 @@ wheels/
 # Runtime files
 .call_id
 .highlights.json
+.analysis.json
+.controversies.json
+.report.json
+.transcript.json
+.status.json
+.questions.json
 
 # Model weights (auto-downloaded on first run)
 *.pt

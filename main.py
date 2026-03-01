@@ -86,6 +86,12 @@ game_state: dict = {
     "start_time": None,
 }
 
+# ── Gemini Send Lock ──────────────────────────────────────────────────
+# Prevents concurrent sends to the Gemini WebSocket which causes 1011 crashes.
+# All simple_response() calls must acquire this lock before sending.
+_gemini_send_lock = asyncio.Lock()
+_backoff_until: float = 0.0  # timestamp — skip all sends until this time passes
+
 # ── Transcript Ring Buffer ─────────────────────────────────────────────
 # Stores agent speech transcripts for the frontend to poll
 _transcript_lines: list[dict] = []
@@ -172,7 +178,7 @@ def _save_highlights() -> None:
 async def create_agent(**kwargs) -> Agent:
     """Create the PlayByt sports analyst agent with tools."""
 
-    llm = gemini.Realtime(fps=5)
+    llm = gemini.Realtime(fps=3)
 
     # ── Tool: Log Highlight ─────────────────────────────────────────
     @llm.register_function(
@@ -277,8 +283,8 @@ async def create_agent(**kwargs) -> Agent:
     # ── Custom Sports Intelligence Processor ────────────────────────
     sports = SportsProcessor(
         model_path="yolo11n-pose.pt",
-        conf_threshold=0.45,
-        fps=5,
+        conf_threshold=0.5,
+        fps=1,
     )
 
     # ── Tool: Get Field Analysis ────────────────────────────────────
@@ -427,15 +433,23 @@ async def _commentary_loop(agent: Agent, sports: SportsProcessor) -> None:
     3. Send it to Gemini as a nudge → Gemini speaks
     4. Log the transcript for the frontend
     """
+    global _backoff_until
     _update_status(commentary_loop="starting")
-    await asyncio.sleep(15)  # Let agent settle after joining
+    await asyncio.sleep(15)  # Let Gemini session stabilize before first commentary
     _update_status(commentary_loop="active")
-    logger.info("🎙️ Commentary loop started — agent will speak every ~15s")
+    logger.info("🎙️ Commentary loop started — agent will speak every ~12s")
 
     tick = 0
     while True:
         try:
             tick += 1
+
+            # Skip tick if recovering from a Gemini WebSocket crash (1011)
+            if time.time() < _backoff_until:
+                logger.debug("Commentary tick #%d skipped (backoff)", tick)
+                await asyncio.sleep(12 + (tick % 4))
+                continue
+
             analysis = sports.latest_analysis
             player_count = analysis.get("player_count", 0) if analysis else 0
 
@@ -480,43 +494,62 @@ async def _commentary_loop(agent: Agent, sports: SportsProcessor) -> None:
                     prompt = prompts[tick % len(prompts)]
 
                 try:
-                    await asyncio.wait_for(
-                        agent.llm.simple_response(text=prompt),
-                        timeout=12.0,
-                    )
+                    async with _gemini_send_lock:
+                        await asyncio.wait_for(
+                            agent.llm.simple_response(text=prompt),
+                            timeout=12.0,
+                        )
                     _update_status(last_commentary=time.time())
                     logger.info("🎙️ Commentary tick #%d delivered", tick)
                 except asyncio.TimeoutError:
                     logger.debug("Commentary tick #%d timed out", tick)
                 except Exception as e:
-                    logger.debug("Commentary tick #%d failed: %s", tick, e)
-            else:
-                # No players visible — occasional ambient comment
-                if tick % 4 == 0:
-                    try:
-                        await asyncio.wait_for(
-                            agent.llm.simple_response(
-                                text=(
-                                    "No players currently visible in the frame. "
-                                    "Describe what you see on the screen share — "
-                                    "is it a replay, graphic, ad break, or something else? "
-                                    "One sentence."
-                                )
-                            ),
-                            timeout=8.0,
+                    err_str = str(e)
+                    if "1011" in err_str or "ConnectionClosed" in type(e).__name__:
+                        _backoff_until = time.time() + 20
+                        logger.warning(
+                            "🔴 Gemini 1011 crash — backing off 20s (tick #%d)", tick
                         )
-                    except Exception:
-                        pass
+                    else:
+                        logger.debug("Commentary tick #%d failed: %s", tick, e)
+            else:
+                # No players visible — stay silent, don't describe empty/pixelated frames
+                pass
 
         except asyncio.CancelledError:
             logger.info("🎙️ Commentary loop cancelled")
             _update_status(commentary_loop="stopped")
             return
         except Exception as e:
-            logger.debug("Commentary loop error: %s", e)
+            err_str = str(e)
+            if "1011" in err_str or "ConnectionClosed" in type(e).__name__:
+                _backoff_until = time.time() + 20
+                logger.warning("🔴 Gemini 1011 crash (outer) — backing off 20s")
+            else:
+                logger.debug("Commentary loop error: %s", e)
 
-        # ── Check for queued user questions BEFORE sleeping ──
+        # Wait 12-15 seconds between comments (slight jitter to feel natural)
+        await asyncio.sleep(12 + (tick % 4))
+
+
+# ── Independent Question Loop ──────────────────────────────────────────
+async def _question_loop(agent: Agent) -> None:
+    """
+    Independent loop that checks for user text questions every 3 seconds.
+    Runs separately from commentary so questions get answered faster.
+    Uses the same send lock to prevent concurrent Gemini sends.
+    """
+    global _backoff_until
+    await asyncio.sleep(10)  # Let agent settle before accepting questions
+    logger.info("❓ Question loop started — checking every 3s")
+
+    while True:
         try:
+            # Respect backoff from Gemini crashes
+            if time.time() < _backoff_until:
+                await asyncio.sleep(3)
+                continue
+
             questions = _safe_read_json(QUESTIONS_FILE, fallback=[])
             pending = [q for q in questions if not q.get("answered")]
             for q in pending:
@@ -534,24 +567,34 @@ async def _commentary_loop(agent: Agent, sports: SportsProcessor) -> None:
                     f"Keep it under 3 sentences."
                 )
                 try:
-                    await asyncio.wait_for(
-                        agent.llm.simple_response(text=prompt),
-                        timeout=12.0,
-                    )
+                    async with _gemini_send_lock:
+                        await asyncio.wait_for(
+                            agent.llm.simple_response(text=prompt),
+                            timeout=12.0,
+                        )
                     _update_status(last_commentary=time.time())
                     logger.info("✅ Answered question from %s", user)
                 except asyncio.TimeoutError:
                     logger.debug("Question answer timed out for: %s", question_text)
                 except Exception as e:
-                    logger.debug("Question answer failed: %s", e)
+                    err_str = str(e)
+                    if "1011" in err_str or "ConnectionClosed" in type(e).__name__:
+                        _backoff_until = time.time() + 20
+                        logger.warning(
+                            "🔴 Gemini 1011 crash in question loop — backing off 20s"
+                        )
+                    else:
+                        logger.debug("Question answer failed: %s", e)
 
             if pending:
                 _safe_write_json(QUESTIONS_FILE, questions)
+        except asyncio.CancelledError:
+            logger.info("❓ Question loop cancelled")
+            return
         except Exception as e:
             logger.debug("Question check error: %s", e)
 
-        # Wait 15-18 seconds between comments (slight jitter to feel natural)
-        await asyncio.sleep(15 + (tick % 4))
+        await asyncio.sleep(3)
 
 
 # ── Transcript Capture Hook ────────────────────────────────────────────
@@ -567,9 +610,8 @@ def _setup_transcript_capture(agent: Agent) -> None:
             async def _on_transcript(text: str, **kw: Any) -> None:
                 await _append_transcript(text, source="agent")
 
-            @agent.on('user_transcript')
-            async def _on_user_transcript(text: str, **kw: Any) -> None:
-                await _append_transcript(text, source="user")
+            # NOTE: We intentionally do NOT hook user_transcript.
+            # User voice/speech is never collected, stored, or logged — privacy first.
     except Exception:
         pass
 
@@ -612,14 +654,15 @@ async def join_call(agent: Agent, call_type: str, call_id: str, **kwargs) -> Non
         _update_status(gemini="connected", yolo="active")
         _setup_transcript_capture(agent)
 
-        # Send greeting
+        # Send greeting (uses send lock to avoid collisions)
         try:
-            await asyncio.wait_for(
-                agent.llm.simple_response(
-                    text="PlayByt online. Share your screen and I will catch what you miss."
-                ),
-                timeout=10.0,
-            )
+            async with _gemini_send_lock:
+                await asyncio.wait_for(
+                    agent.llm.simple_response(
+                        text="PlayByt online. Share your screen and I will catch what you miss."
+                    ),
+                    timeout=10.0,
+                )
             await _append_transcript(
                 "PlayByt online. Share your screen and I will catch what you miss.",
                 source="agent",
@@ -631,9 +674,11 @@ async def join_call(agent: Agent, call_type: str, call_id: str, **kwargs) -> Non
 
         # Start the proactive commentary loop alongside the forever-block
         commentary_task = None
+        question_task = None
         if sports:
             commentary_task = asyncio.ensure_future(_commentary_loop(agent, sports))
-            logger.info("🎙️ Commentary loop scheduled")
+            question_task = asyncio.ensure_future(_question_loop(agent))
+            logger.info("🎙️ Commentary + question loops scheduled")
         else:
             logger.warning("No SportsProcessor found — commentary loop disabled")
 
@@ -642,6 +687,8 @@ async def join_call(agent: Agent, call_type: str, call_id: str, **kwargs) -> Non
         except asyncio.CancelledError:
             if commentary_task:
                 commentary_task.cancel()
+            if question_task:
+                question_task.cancel()
             _update_status(gemini="disconnected", commentary_loop="stopped")
             logger.info("Agent session cancelled — shutting down.")
 

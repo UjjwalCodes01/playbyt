@@ -104,6 +104,9 @@ class SportsProcessor(VideoProcessorPublisher):
         self._prev_pressing: str = "none"
         self._prev_fatigue_count: int = 0
         self._prev_formation: str = "N/A"
+        self._last_alert_time: Dict[str, float] = {}  # Cooldown per alert type
+        self._ALERT_COOLDOWN: float = 30.0  # Min seconds between same alert type
+        self._MIN_PLAYERS_FOR_ALERTS: int = 4  # Don't fire alerts with < 4 players
         self._start_time: float = time.time()
         self._frame_count: int = 0
         self._error_count: int = 0
@@ -339,10 +342,10 @@ class SportsProcessor(VideoProcessorPublisher):
             else:
                 zones["att_third"] += 1
 
-        # Dominant side
-        if zones["left"] > zones["right"] + 1:
+        # Dominant side (need at least 3 players for this to be meaningful)
+        if len(positions) >= 3 and zones["left"] > zones["right"] + 1:
             dominant_side = "left"
-        elif zones["right"] > zones["left"] + 1:
+        elif len(positions) >= 3 and zones["right"] > zones["left"] + 1:
             dominant_side = "right"
         else:
             dominant_side = "balanced"
@@ -432,27 +435,41 @@ class SportsProcessor(VideoProcessorPublisher):
     def _detect_controversies(self, analysis: Dict[str, Any]) -> None:
         """Detect threshold-based controversy events and persist them."""
         elapsed = round(time.time() - self._start_time)
+        now = time.time()
         alerts: List[Dict[str, Any]] = []
 
         pressing = analysis.get("pressing_intensity", "none")
         formation = analysis.get("formation", "N/A")
         fatigue_flags = analysis.get("fatigue_flags", [])
         fatigue_count = len(fatigue_flags)
+        player_count = analysis.get("player_count", 0)
+
+        # Gate: don't fire any alerts with fewer than MIN_PLAYERS
+        if player_count < self._MIN_PLAYERS_FOR_ALERTS:
+            self._prev_pressing = pressing
+            self._prev_formation = formation
+            self._prev_fatigue_count = fatigue_count
+            return
+
+        def _can_fire(alert_type: str) -> bool:
+            """Check cooldown for this alert type."""
+            last = self._last_alert_time.get(alert_type, 0)
+            return (now - last) >= self._ALERT_COOLDOWN
 
         # Alert: pressing spiked to HIGH from lower level
-        if pressing == "high" and self._prev_pressing in ("none", "low"):
+        if pressing == "high" and self._prev_pressing in ("none", "low") and _can_fire("pressing_spike"):
             alerts.append({
                 "type": "pressing_spike",
-                "title": "⚡ High Press Triggered",
+                "title": "High Press Triggered",
                 "description": f"Pressing intensity spiked to HIGH from {self._prev_pressing.upper()}",
                 "elapsed": elapsed,
             })
 
-        # Alert: pressing dropped from HIGH (possible break / counter-attack window)
-        if self._prev_pressing == "high" and pressing in ("none", "low"):
+        # Alert: pressing dropped from HIGH
+        if self._prev_pressing == "high" and pressing in ("none", "low") and _can_fire("press_drop"):
             alerts.append({
                 "type": "press_drop",
-                "title": "🔓 Press Broken",
+                "title": "Press Broken",
                 "description": "High press dropped — counter-attack window open",
                 "elapsed": elapsed,
             })
@@ -461,42 +478,45 @@ class SportsProcessor(VideoProcessorPublisher):
         if (
             formation not in ("N/A", self._prev_formation)
             and self._prev_formation != "N/A"
+            and _can_fire("formation_change")
         ):
             alerts.append({
                 "type": "formation_change",
-                "title": "🔄 Formation Shift",
-                "description": f"Formation changed: {self._prev_formation} → {formation}",
+                "title": "Formation Shift",
+                "description": f"Formation changed: {self._prev_formation} -> {formation}",
                 "elapsed": elapsed,
             })
 
         # Alert: fatigue spike (3+ new fatigue flags compared to previous)
-        if fatigue_count >= 3 and self._prev_fatigue_count < 2:
+        if fatigue_count >= 3 and self._prev_fatigue_count < 2 and _can_fire("fatigue_spike"):
             players = ", ".join(str(f["player_id"] + 1) for f in fatigue_flags[:3])
             alerts.append({
                 "type": "fatigue_spike",
-                "title": "😤 Fatigue Alert",
-                "description": f"{fatigue_count} players showing fatigue — substitution risk (players {players})",
+                "title": "Fatigue Alert",
+                "description": f"{fatigue_count} players showing fatigue (players {players})",
                 "elapsed": elapsed,
             })
 
-        # Alert: dominant side overload
+        # Alert: dominant side overload (need 6+ players and 75%+ on one side)
         zones = analysis.get("zones", {})
         left, right = zones.get("left", 0), zones.get("right", 0)
-        total = max(left + right, 1)
-        if left / total > 0.8 or right / total > 0.8:
-            side = "LEFT" if left > right else "RIGHT"
-            alerts.append({
-                "type": "overload",
-                "title": f"📐 {side} Overload",
-                "description": f"Extreme {side.lower()}-side congestion — {max(left, right)}/{left + right} players",
-                "elapsed": elapsed,
-            })
+        total = left + right
+        if total >= 6 and _can_fire("overload"):
+            if left / total > 0.75 or right / total > 0.75:
+                side = "LEFT" if left > right else "RIGHT"
+                alerts.append({
+                    "type": "overload",
+                    "title": f"{side} Overload",
+                    "description": f"Strong {side.lower()}-side congestion — {max(left, right)}/{total} players",
+                    "elapsed": elapsed,
+                })
 
         if alerts:
             for alert in alerts:
                 alert["id"] = len(self._controversies) + 1
-                alert["timestamp"] = time.time()
+                alert["timestamp"] = now
                 self._controversies.append(alert)
+                self._last_alert_time[alert["type"]] = now
             asyncio.ensure_future(self._persist_controversies())
 
         # Update prev state
