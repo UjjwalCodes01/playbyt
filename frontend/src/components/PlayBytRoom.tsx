@@ -504,11 +504,12 @@ function RoomLayout({ config, commentary, addCommentary, onLeave }: RoomLayoutPr
   const effectiveAgentParticipant = agentParticipant ?? lastKnownAgentParticipant.current
   // Screen-sharing participant (could be anyone)
   const screenShareParticipant = participants.find(p => hasScreenShare(p))
-  // Other human participants (exclude agent and screen share duplicates)
+  // Other human participants (exclude agent, screen share, and local user since they're in the split view)
   const humanParticipants = participants.filter(p =>
     !p.userId?.startsWith('playbyt') &&
     p.name?.toLowerCase() !== 'playbyt' &&
-    !hasScreenShare(p)
+    !hasScreenShare(p) &&
+    !p.isLocalParticipant
   )
   // Local user participant (for split view when no screen share)
   const localParticipant = participants.find(p => p.isLocalParticipant)
