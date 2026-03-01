@@ -19,9 +19,11 @@ With this, Gemini has superhuman spatial data no human eye can compute in real t
 """
 
 import asyncio
+import json
 import logging
 import math
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import av
@@ -32,7 +34,19 @@ from vision_agents.core.utils.video_forwarder import VideoForwarder
 from vision_agents.core.utils.video_track import QueuedVideoTrack
 from vision_agents.plugins.ultralytics import YOLOPoseProcessor
 
+ANALYSIS_FILE = Path(__file__).parent / ".analysis.json"
+CONTROVERSIES_FILE = Path(__file__).parent / ".controversies.json"
+
 logger = logging.getLogger(__name__)
+
+# Participants to skip — SDK demo user and non-screenshare camera feeds
+_SKIP_PARTICIPANT_PREFIXES = ("user-demo", "demo-agent", "user-demo-agent")
+
+# Suppress noisy H264/VP8 decode errors from SDK demo browser feed
+logging.getLogger("libav.h264").setLevel(logging.CRITICAL)
+logging.getLogger("libav.libvpx").setLevel(logging.CRITICAL)
+logging.getLogger("aiortc.codecs.h264").setLevel(logging.CRITICAL)
+logging.getLogger("aiortc.codecs.vpx").setLevel(logging.CRITICAL)
 
 # ── COCO Pose Keypoint Indices ──────────────────────────────────────────────
 NOSE = 0
@@ -85,6 +99,24 @@ class SportsProcessor(VideoProcessorPublisher):
         self.latest_analysis: Dict[str, Any] = {}
         self._analysis_history: List[Dict[str, Any]] = []
 
+        # Controversy detection state
+        self._controversies: List[Dict[str, Any]] = []
+        self._prev_pressing: str = "none"
+        self._prev_fatigue_count: int = 0
+        self._prev_formation: str = "N/A"
+        self._start_time: float = time.time()
+        self._frame_count: int = 0
+        self._error_count: int = 0
+        self._consecutive_errors: int = 0
+        self._MAX_CONSECUTIVE_ERRORS: int = 20  # Stop logging after 20 in a row
+
+        # Clear stale files on boot
+        try:
+            ANALYSIS_FILE.write_text("{}")
+            CONTROVERSIES_FILE.write_text("[]")
+        except Exception:
+            pass
+
         logger.info("⚽ Sports Intelligence Processor initialized")
 
     # ── Video Pipeline ──────────────────────────────────────────────────────
@@ -96,8 +128,24 @@ class SportsProcessor(VideoProcessorPublisher):
         shared_forwarder: Optional[VideoForwarder] = None,
     ) -> None:
         """Set up the video processing pipeline."""
+        # Skip SDK demo user and non-screenshare camera feeds
+        pid = participant_id or ""
+        if any(pid.startswith(prefix) for prefix in _SKIP_PARTICIPANT_PREFIXES):
+            logger.info("⚽ Skipping demo/non-screenshare participant: %s", pid)
+            return
+
+        # Only replace if we're getting a NEW track — don't tear down the same one
         if self._video_forwarder is not None:
-            await self._video_forwarder.remove_frame_handler(self._process_frame)
+            if shared_forwarder and shared_forwarder is self._video_forwarder:
+                # Same forwarder — just re-add the handler (idempotent)
+                logger.info("⚽ Re-attaching frame handler for participant: %s", pid)
+            else:
+                # Different track — tear down old and set up new
+                logger.info("⚽ Replacing video forwarder for new participant: %s", pid)
+                try:
+                    await self._video_forwarder.remove_frame_handler(self._process_frame)
+                except Exception:
+                    pass
 
         logger.info(f"⚽ Starting Sports Intelligence processing at {self.fps} FPS")
         self._video_forwarder = (
@@ -119,32 +167,71 @@ class SportsProcessor(VideoProcessorPublisher):
         if self._shutdown:
             return
 
+        self._frame_count += 1
+
+        # Step 1: Decode frame
         try:
             frame_array = frame.to_ndarray(format="rgb24")
+        except Exception as e:
+            self._consecutive_errors += 1
+            if self._consecutive_errors <= 3:
+                logger.warning("⚽ Frame decode failed (#%d): %s", self._frame_count, e)
+            try:
+                await self._video_track.add_frame(frame)
+            except Exception:
+                pass
+            return
 
-            # 1. Run YOLO pose detection — get annotated frame + structured pose data
+        # Step 2: YOLO pose detection
+        try:
             annotated, pose_data = await self._yolo.add_pose_to_ndarray(frame_array)
+        except Exception as e:
+            self._error_count += 1
+            self._consecutive_errors += 1
+            if self._consecutive_errors <= 5:
+                logger.warning("⚽ YOLO inference failed on frame #%d: %s", self._frame_count, e)
+            try:
+                raw_frame = av.VideoFrame.from_ndarray(frame_array, format="rgb24")
+                await self._video_track.add_frame(raw_frame)
+            except Exception:
+                try:
+                    await self._video_track.add_frame(frame)
+                except Exception:
+                    pass
+            return
 
-            # 2. Compute sports intelligence from pose keypoints
+        self._consecutive_errors = 0
+
+        # Step 3: Compute analysis + store + detect controversies
+        try:
             h, w = annotated.shape[:2]
             analysis = self._compute_analysis(pose_data, w, h)
-
-            # 3. Store for tool calling
             self.latest_analysis = analysis
             self._analysis_history.append(analysis)
-            if len(self._analysis_history) > 30:  # Keep ~10 seconds at 3fps
+            if len(self._analysis_history) > 30:
                 self._analysis_history = self._analysis_history[-30:]
+            asyncio.ensure_future(self._persist_analysis(analysis))
+            self._detect_controversies(analysis)
+        except Exception as e:
+            self._error_count += 1
+            if self._error_count % 50 == 1:
+                logger.warning("⚽ Analysis error on frame #%d (total: %d): %s", self._frame_count, self._error_count, e)
 
-            # 4. Draw HUD overlay on the annotated frame
-            self._draw_hud(annotated, analysis)
+        # Step 4: Draw HUD
+        try:
+            self._draw_hud(annotated, self.latest_analysis or {})
+        except Exception:
+            pass  # HUD failure should never block video
 
-            # 5. Publish the processed frame
+        # Step 5: Publish processed frame (with fallback to raw)
+        try:
             processed = av.VideoFrame.from_ndarray(annotated, format="rgb24")
             await self._video_track.add_frame(processed)
-
-        except Exception as e:
-            logger.exception(f"⚽ Frame processing failed: {e}")
-            await self._video_track.add_frame(frame)
+        except Exception:
+            try:
+                await self._video_track.add_frame(frame)
+            except Exception:
+                pass
 
     def publish_video_track(self) -> QueuedVideoTrack:
         """Return the output video track."""
@@ -341,6 +428,113 @@ class SportsProcessor(VideoProcessorPublisher):
                 trend["player_movement"] = "stable"
 
         return trend
+
+    def _detect_controversies(self, analysis: Dict[str, Any]) -> None:
+        """Detect threshold-based controversy events and persist them."""
+        elapsed = round(time.time() - self._start_time)
+        alerts: List[Dict[str, Any]] = []
+
+        pressing = analysis.get("pressing_intensity", "none")
+        formation = analysis.get("formation", "N/A")
+        fatigue_flags = analysis.get("fatigue_flags", [])
+        fatigue_count = len(fatigue_flags)
+
+        # Alert: pressing spiked to HIGH from lower level
+        if pressing == "high" and self._prev_pressing in ("none", "low"):
+            alerts.append({
+                "type": "pressing_spike",
+                "title": "⚡ High Press Triggered",
+                "description": f"Pressing intensity spiked to HIGH from {self._prev_pressing.upper()}",
+                "elapsed": elapsed,
+            })
+
+        # Alert: pressing dropped from HIGH (possible break / counter-attack window)
+        if self._prev_pressing == "high" and pressing in ("none", "low"):
+            alerts.append({
+                "type": "press_drop",
+                "title": "🔓 Press Broken",
+                "description": "High press dropped — counter-attack window open",
+                "elapsed": elapsed,
+            })
+
+        # Alert: formation changed significantly
+        if (
+            formation not in ("N/A", self._prev_formation)
+            and self._prev_formation != "N/A"
+        ):
+            alerts.append({
+                "type": "formation_change",
+                "title": "🔄 Formation Shift",
+                "description": f"Formation changed: {self._prev_formation} → {formation}",
+                "elapsed": elapsed,
+            })
+
+        # Alert: fatigue spike (3+ new fatigue flags compared to previous)
+        if fatigue_count >= 3 and self._prev_fatigue_count < 2:
+            players = ", ".join(str(f["player_id"] + 1) for f in fatigue_flags[:3])
+            alerts.append({
+                "type": "fatigue_spike",
+                "title": "😤 Fatigue Alert",
+                "description": f"{fatigue_count} players showing fatigue — substitution risk (players {players})",
+                "elapsed": elapsed,
+            })
+
+        # Alert: dominant side overload
+        zones = analysis.get("zones", {})
+        left, right = zones.get("left", 0), zones.get("right", 0)
+        total = max(left + right, 1)
+        if left / total > 0.8 or right / total > 0.8:
+            side = "LEFT" if left > right else "RIGHT"
+            alerts.append({
+                "type": "overload",
+                "title": f"📐 {side} Overload",
+                "description": f"Extreme {side.lower()}-side congestion — {max(left, right)}/{left + right} players",
+                "elapsed": elapsed,
+            })
+
+        if alerts:
+            for alert in alerts:
+                alert["id"] = len(self._controversies) + 1
+                alert["timestamp"] = time.time()
+                self._controversies.append(alert)
+            asyncio.ensure_future(self._persist_controversies())
+
+        # Update prev state
+        self._prev_pressing = pressing
+        self._prev_formation = formation
+        self._prev_fatigue_count = fatigue_count
+
+    def get_latest_controversies(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """Return the most recent controversy events."""
+        return self._controversies[-limit:]
+
+    async def _persist_analysis(self, analysis: Dict[str, Any]) -> None:
+        """Write analysis to disk with file locking for safe concurrent reads."""
+        import fcntl
+        try:
+            data = json.dumps(analysis)
+            def _write():
+                with open(ANALYSIS_FILE, "w") as f:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                    f.write(data)
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            await asyncio.to_thread(_write)
+        except Exception:
+            pass
+
+    async def _persist_controversies(self) -> None:
+        """Write controversies to disk with file locking for safe concurrent reads."""
+        import fcntl
+        try:
+            data = json.dumps(self._controversies[-50:])
+            def _write():
+                with open(CONTROVERSIES_FILE, "w") as f:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                    f.write(data)
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            await asyncio.to_thread(_write)
+        except Exception:
+            pass
 
     # ── HUD Overlay ─────────────────────────────────────────────────────────
 
