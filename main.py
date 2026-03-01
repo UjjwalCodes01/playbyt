@@ -781,6 +781,11 @@ async def _question_loop(agent: Agent) -> None:
                 await asyncio.sleep(12)
                 continue
 
+            # Don't answer questions into an empty room — burns credits for nobody
+            if not _room_has_users():
+                await asyncio.sleep(12)
+                continue
+
             questions = _safe_read_json(QUESTIONS_FILE, fallback=[])
             pending = [q for q in questions if not q.get("answered")]
             if pending:
@@ -873,21 +878,25 @@ async def join_call(agent: Agent, call_type: str, call_id: str, **kwargs) -> Non
         # Let WebRTC + Gemini session fully handshake before the first send
         await asyncio.sleep(3)
 
-        # Send greeting (uses send lock to avoid collisions)
-        try:
-            async with _gemini_send_lock:
-                await asyncio.wait_for(
-                    agent.llm.simple_response(
-                        text="PlayByt online. Share your screen and I will catch what you miss."
-                    ),
-                    timeout=10.0,
+        # Send greeting ONLY if a user is already in the room.
+        # If nobody is present yet, skip — saves one Gemini call on every reconnect.
+        if _room_has_users():
+            try:
+                async with _gemini_send_lock:
+                    await asyncio.wait_for(
+                        agent.llm.simple_response(
+                            text="PlayByt online. Share your screen and I will catch what you miss."
+                        ),
+                        timeout=10.0,
+                    )
+                await _append_transcript(
+                    "PlayByt online. Share your screen and I will catch what you miss.",
+                    source="agent",
                 )
-            await _append_transcript(
-                "PlayByt online. Share your screen and I will catch what you miss.",
-                source="agent",
-            )
-        except (asyncio.TimeoutError, Exception) as e:
-            logger.info("Startup greeting skipped: %s", e)
+            except (asyncio.TimeoutError, Exception) as e:
+                logger.info("Startup greeting skipped: %s", e)
+        else:
+            logger.info("Startup greeting skipped — room empty, saving Gemini credits")
 
         logger.info("PlayByt is live — starting commentary loop...")
 
