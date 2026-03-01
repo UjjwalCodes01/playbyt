@@ -150,7 +150,7 @@ Expected:
 Edit `frontend/.env.production`:
 
 ```env
-VITE_STREAM_API_KEY=m8ryv5sy48sa
+VITE_STREAM_API_KEY=m8
 VITE_API_URL=https://playbyt-backend-xxxxxx.run.app
 ```
 
@@ -223,7 +223,7 @@ gcloud run deploy playbyt-backend \
   --cpu 2 \
   --timeout 3600 \
   --concurrency 1 \
-  --set-env-vars="GEMINI_API_KEY=AIzaSyCH6rn3x8mL4bdSH3NOvN2F7i3ctdp7tyU,STREAM_API_KEY=m8ryv5sy48sa,STREAM_API_SECRET=auxd6y2n3wknmxmjj8kx3gpd7febbjwxpm7abs2xwv7vvd24cvsqh3ucd4knjce8"
+  --set-env-vars="GEMINI_API_KEY=
 ```
 
 ---
@@ -258,7 +258,7 @@ gcloud run deploy playbyt-backend \
 | Variable | Where | Value |
 |----------|-------|-------|
 | `GEMINI_API_KEY` | Cloud Run | Your Gemini API key |
-| `STREAM_API_KEY` | Cloud Run + Vercel | `m8ryv5sy48sa` |
+| `STREAM_API_KEY` | Cloud Run + Vercel | `m8a` |
 | `STREAM_API_SECRET` | Cloud Run only | Your Stream secret |
 | `VITE_API_URL` | Vercel | `https://playbyt-backend-xxxxxx.run.app` |
-| `VITE_STREAM_API_KEY` | Vercel | `m8ryv5sy48sa` |
+| `VITE_STREAM_API_KEY` | Vercel | `m8ry |
