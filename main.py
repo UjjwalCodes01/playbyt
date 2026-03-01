@@ -10,6 +10,7 @@ Architecture:
 """
 
 import asyncio
+import concurrent.futures
 import fcntl
 import json
 import logging
@@ -30,7 +31,28 @@ from sports_processor import SportsProcessor
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# ── SDK monkey-patch ───────────────────────────────────────────────────────────
+# ── SDK monkey-patch: Gemini reconnect on 1008 ────────────────────────────────
+# The SDK's _should_reconnect only handles 1011-1014.  Code 1008 ("policy
+# violation — operation not supported") leaves the processing loop spinning on
+# a dead WebSocket.  Patch the function so the SDK auto-reconnects on 1008 too.
+import vision_agents.plugins.gemini.gemini_realtime as _gemini_rt
+import websockets as _ws
+
+_RECONNECT_CODES = {1008, 1011, 1012, 1013, 1014}
+
+def _patched_should_reconnect(exc: Exception) -> bool:
+    if (
+        isinstance(exc, _ws.ConnectionClosedError)
+        and exc.rcvd
+        and exc.rcvd.code in _RECONNECT_CODES
+    ):
+        return True
+    return False
+
+_gemini_rt._should_reconnect = _patched_should_reconnect
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── SDK monkey-patch: create_call ──────────────────────────────────────────────
 # The SDK's create_call passes data as a plain dict {"created_by_id": ...} which
 # the getstream REST client doesn't serialize the same way as a CallRequest
 # dataclass, causing a 400 from the Stream API. Patch it to use CallRequest.
@@ -92,6 +114,13 @@ game_state: dict = {
 _gemini_send_lock = asyncio.Lock()
 _backoff_until: float = 0.0  # timestamp — skip all sends until this time passes
 
+# ── Bounded I/O Thread Pool ────────────────────────────────────────────
+# 2-worker pool for all file writes. Avoids spawning a new OS thread on every
+# highlight/transcript write, which was starving the Gemini WebSocket receive loop.
+_io_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=2, thread_name_prefix="playbyt-io"
+)
+
 # ── Transcript Ring Buffer ─────────────────────────────────────────────
 # Stores agent speech transcripts for the frontend to poll
 _transcript_lines: list[dict] = []
@@ -113,9 +142,9 @@ async def _append_transcript(text: str, source: str = "agent") -> None:
     # Keep last 100 lines
     if len(_transcript_lines) > 100:
         _transcript_lines[:] = _transcript_lines[-100:]
-    # Persist async
-    asyncio.ensure_future(
-        asyncio.to_thread(_safe_write_json, TRANSCRIPT_FILE, _transcript_lines[-50:])
+    # Write via bounded thread pool — reuses threads instead of spawning new ones
+    asyncio.get_running_loop().run_in_executor(
+        _io_executor, _safe_write_json, TRANSCRIPT_FILE, list(_transcript_lines[-50:])
     )
 
 
@@ -129,13 +158,20 @@ _agent_status: dict = {
 }
 
 
+_last_status_write: float = 0.0
+
+
 def _update_status(**kwargs: Any) -> None:
-    """Update agent status and persist."""
+    """Update in-memory status; write to disk at most every 10 seconds."""
+    global _last_status_write
     _agent_status.update(kwargs)
-    try:
-        _safe_write_json(STATUS_FILE, _agent_status)
-    except Exception:
-        pass
+    now = time.time()
+    if now - _last_status_write >= 10:
+        _last_status_write = now
+        try:
+            _safe_write_json(STATUS_FILE, _agent_status)
+        except Exception:
+            pass
 
 
 def _persist_call_id(call_type: str, call_id: str) -> None:
@@ -178,7 +214,7 @@ def _save_highlights() -> None:
 async def create_agent(**kwargs) -> Agent:
     """Create the PlayByt sports analyst agent with tools."""
 
-    llm = gemini.Realtime(fps=3)
+    llm = gemini.Realtime(fps=2)
 
     # ── Tool: Log Highlight ─────────────────────────────────────────
     @llm.register_function(
@@ -202,9 +238,9 @@ async def create_agent(**kwargs) -> Agent:
             ),
         }
         game_state["highlights"].append(highlight)
-        asyncio.ensure_future(asyncio.to_thread(
-            _safe_write_json, HIGHLIGHTS_FILE, game_state["highlights"]
-        ))
+        asyncio.get_running_loop().run_in_executor(
+            _io_executor, _safe_write_json, HIGHLIGHTS_FILE, list(game_state["highlights"])
+        )
         logger.info("⚡ Highlight #%d: %s", highlight["id"], description)
         return f"Highlight #{highlight['id']} logged: {description}"
 
@@ -447,7 +483,7 @@ async def _commentary_loop(agent: Agent, sports: SportsProcessor) -> None:
             # Skip tick if recovering from a Gemini WebSocket crash (1011)
             if time.time() < _backoff_until:
                 logger.debug("Commentary tick #%d skipped (backoff)", tick)
-                await asyncio.sleep(12 + (tick % 4))
+                await asyncio.sleep(15)
                 continue
 
             analysis = sports.latest_analysis
@@ -505,10 +541,11 @@ async def _commentary_loop(agent: Agent, sports: SportsProcessor) -> None:
                     logger.debug("Commentary tick #%d timed out", tick)
                 except Exception as e:
                     err_str = str(e)
-                    if "1011" in err_str or "ConnectionClosed" in type(e).__name__:
-                        _backoff_until = time.time() + 20
+                    if "1008" in err_str or "1011" in err_str or "ConnectionClosed" in type(e).__name__:
+                        _backoff_until = time.time() + 25
                         logger.warning(
-                            "🔴 Gemini 1011 crash — backing off 20s (tick #%d)", tick
+                            "🔴 Gemini crash (%s) — backing off 25s (tick #%d)",
+                            type(e).__name__, tick,
                         )
                     else:
                         logger.debug("Commentary tick #%d failed: %s", tick, e)
@@ -522,14 +559,14 @@ async def _commentary_loop(agent: Agent, sports: SportsProcessor) -> None:
             return
         except Exception as e:
             err_str = str(e)
-            if "1011" in err_str or "ConnectionClosed" in type(e).__name__:
-                _backoff_until = time.time() + 20
-                logger.warning("🔴 Gemini 1011 crash (outer) — backing off 20s")
+            if "1008" in err_str or "1011" in err_str or "ConnectionClosed" in type(e).__name__:
+                _backoff_until = time.time() + 25
+                logger.warning("🔴 Gemini crash (outer) — backing off 25s")
             else:
                 logger.debug("Commentary loop error: %s", e)
 
-        # Wait 12-15 seconds between comments (slight jitter to feel natural)
-        await asyncio.sleep(12 + (tick % 4))
+        # Wait a consistent 15 seconds between proactive commentary ticks
+        await asyncio.sleep(15)
 
 
 # ── Independent Question Loop ──────────────────────────────────────────
@@ -547,7 +584,7 @@ async def _question_loop(agent: Agent) -> None:
         try:
             # Respect backoff from Gemini crashes
             if time.time() < _backoff_until:
-                await asyncio.sleep(3)
+                await asyncio.sleep(8)
                 continue
 
             questions = _safe_read_json(QUESTIONS_FILE, fallback=[])
@@ -578,10 +615,10 @@ async def _question_loop(agent: Agent) -> None:
                     logger.debug("Question answer timed out for: %s", question_text)
                 except Exception as e:
                     err_str = str(e)
-                    if "1011" in err_str or "ConnectionClosed" in type(e).__name__:
-                        _backoff_until = time.time() + 20
+                    if "1008" in err_str or "1011" in err_str or "ConnectionClosed" in type(e).__name__:
+                        _backoff_until = time.time() + 25
                         logger.warning(
-                            "🔴 Gemini 1011 crash in question loop — backing off 20s"
+                            "🔴 Gemini crash in question loop — backing off 25s"
                         )
                     else:
                         logger.debug("Question answer failed: %s", e)
@@ -594,7 +631,7 @@ async def _question_loop(agent: Agent) -> None:
         except Exception as e:
             logger.debug("Question check error: %s", e)
 
-        await asyncio.sleep(3)
+        await asyncio.sleep(8)
 
 
 # ── Transcript Capture Hook ────────────────────────────────────────────
@@ -654,6 +691,9 @@ async def join_call(agent: Agent, call_type: str, call_id: str, **kwargs) -> Non
         _update_status(gemini="connected", yolo="active")
         _setup_transcript_capture(agent)
 
+        # Let WebRTC + Gemini session fully handshake before the first send
+        await asyncio.sleep(3)
+
         # Send greeting (uses send lock to avoid collisions)
         try:
             async with _gemini_send_lock:
@@ -682,13 +722,18 @@ async def join_call(agent: Agent, call_type: str, call_id: str, **kwargs) -> Non
         else:
             logger.warning("No SportsProcessor found — commentary loop disabled")
 
+        _shutdown = asyncio.Event()
         try:
-            await asyncio.Future()  # Block forever (until cancellation)
+            await _shutdown.wait()  # Block until cancelled — cleaner than Future()
         except asyncio.CancelledError:
+            pass
+        finally:
             if commentary_task:
                 commentary_task.cancel()
+                await asyncio.gather(commentary_task, return_exceptions=True)
             if question_task:
                 question_task.cancel()
+                await asyncio.gather(question_task, return_exceptions=True)
             _update_status(gemini="disconnected", commentary_loop="stopped")
             logger.info("Agent session cancelled — shutting down.")
 
