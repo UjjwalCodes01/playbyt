@@ -112,7 +112,7 @@ gcloud run deploy playbyt-backend \
   --cpu 2 \
   --timeout 3600 \
   --concurrency 1 \
-  --set-env-vars="GEMINI_API_KEY=AIzaSyCH6rn3x8mL4bdSH3NOvN2F7i3ctdp7tyU,STREAM_API_KEY=m8ryv5sy48sa,STREAM_API_SECRET=auxd6y2n3wknmxmjj8kx3gpd7febbjwxpm7abs2xwv7vvd24cvsqh3ucd4knjce8"
+  --set-env-vars="GEMINI_API_KEY=,STREAM_API_KEY=,STREAM_API_SECRET=
 ```
 
 > - `--source .` — Cloud Build builds the Docker image from the local directory
