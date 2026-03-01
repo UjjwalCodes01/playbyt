@@ -11,6 +11,7 @@ export interface RoomConfig {
   userName: string
   userId: string
   userToken: string
+  apiKey: string
   role: FanRole
 }
 

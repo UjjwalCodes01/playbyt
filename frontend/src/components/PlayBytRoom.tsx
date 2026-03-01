@@ -4,9 +4,11 @@ import {
   StreamCall,
   StreamVideoClient,
   ParticipantView,
+  ParticipantsAudio,
   useCall,
   useCallStateHooks,
   hasScreenShare,
+  CallingState,
 } from '@stream-io/video-react-sdk'
 import type { RoomConfig, FanRole } from '../App'
 
@@ -39,7 +41,119 @@ interface CommentaryLine {
   user?: string
 }
 
+interface AnalysisData {
+  player_count: number
+  positions: Array<{ x: number; y: number; id: number }>
+  zones: { left: number; center: number; right: number; def_third: number; mid_third: number; att_third: number }
+  formation: string
+  pressing_intensity: string
+  dominant_side: string
+  fatigue_flags: Array<{ player_id: number; spine_angle: number; severity: string }>
+}
+
+interface ControversyEvent {
+  id: number
+  type: string
+  title: string
+  description: string
+  elapsed: number
+  timestamp: number
+}
+
+interface ToastItem {
+  id: number
+  title: string
+  description: string
+  type: string
+}
+
+interface AgentStatus {
+  gemini: string
+  yolo: string
+  commentary_loop: string
+  frames_processed: number
+  last_commentary: number
+}
+
+interface TranscriptLine {
+  id: number
+  text: string
+  source: string
+  timestamp: number
+  elapsed: number
+}
+
 let commentaryIdCounter = 0
+
+// ─── Tactical Pitch Map ─────────────────────────────────────────────────────
+
+function TacticalMap({ analysis }: { analysis: AnalysisData | null }) {
+  const W = 308
+  const H = 160
+  const pad = 10
+
+  const pressColor: Record<string, string> = {
+    high: 'rgba(0,255,136,0.18)',
+    medium: 'rgba(255,170,0,0.12)',
+    low: 'rgba(68,136,255,0.08)',
+    none: 'rgba(30,30,40,0.6)',
+  }
+  const bg = analysis ? pressColor[analysis.pressing_intensity] ?? pressColor.none : pressColor.none
+
+  const pitchW = W - pad * 2
+  const pitchH = H - pad * 2
+
+  return (
+    <svg width={W} height={H} style={{ display: 'block', borderRadius: '8px', overflow: 'hidden' }}>
+      {/* Pitch background */}
+      <rect x={pad} y={pad} width={pitchW} height={pitchH} fill={bg} rx={4} />
+      <rect x={pad} y={pad} width={pitchW} height={pitchH} fill="none" stroke="rgba(255,255,255,0.12)" strokeWidth={1} rx={4} />
+
+      {/* Center line */}
+      <line x1={W / 2} y1={pad} x2={W / 2} y2={H - pad} stroke="rgba(255,255,255,0.1)" strokeWidth={1} />
+      {/* Center circle */}
+      <circle cx={W / 2} cy={H / 2} r={20} fill="none" stroke="rgba(255,255,255,0.08)" strokeWidth={1} />
+
+      {/* Penalty boxes */}
+      <rect x={pad} y={pad + pitchH * 0.25} width={pitchW * 0.14} height={pitchH * 0.5} fill="none" stroke="rgba(255,255,255,0.08)" strokeWidth={1} />
+      <rect x={W - pad - pitchW * 0.14} y={pad + pitchH * 0.25} width={pitchW * 0.14} height={pitchH * 0.5} fill="none" stroke="rgba(255,255,255,0.08)" strokeWidth={1} />
+
+      {/* Third zone dividers */}
+      <line x1={pad + pitchW / 3} y1={pad} x2={pad + pitchW / 3} y2={H - pad} stroke="rgba(255,255,255,0.05)" strokeWidth={1} strokeDasharray="3,3" />
+      <line x1={pad + (pitchW * 2) / 3} y1={pad} x2={pad + (pitchW * 2) / 3} y2={H - pad} stroke="rgba(255,255,255,0.05)" strokeWidth={1} strokeDasharray="3,3" />
+
+      {/* Player dots */}
+      {analysis?.positions.map((pos, i) => {
+        const cx = pad + pos.x * pitchW
+        const cy = pad + pos.y * pitchH
+        const isFatigued = analysis.fatigue_flags.some(f => f.player_id === pos.id)
+        return (
+          <g key={i}>
+            <circle cx={cx} cy={cy} r={6} fill={isFatigued ? 'rgba(255,80,80,0.9)' : 'rgba(0,200,255,0.85)'} stroke="rgba(0,0,0,0.5)" strokeWidth={1} />
+            <text x={cx} y={cy + 4} textAnchor="middle" fontSize={7} fill="white" fontWeight="bold">{pos.id + 1}</text>
+          </g>
+        )
+      })}
+
+      {/* No players message */}
+      {(!analysis || analysis.player_count === 0) && (
+        <text x={W / 2} y={H / 2} textAnchor="middle" fontSize={10} fill="rgba(255,255,255,0.3)">
+          No players detected
+        </text>
+      )}
+
+      {/* Side overload arrow */}
+      {analysis?.dominant_side === 'left' && (
+        <text x={pad + 4} y={H - pad - 4} fontSize={9} fill="rgba(255,170,0,0.8)" fontWeight="bold">◀ OVERLOAD</text>
+      )}
+      {analysis?.dominant_side === 'right' && (
+        <text x={W - pad - 4} y={H - pad - 4} textAnchor="end" fontSize={9} fill="rgba(255,170,0,0.8)" fontWeight="bold">OVERLOAD ▶</text>
+      )}
+    </svg>
+  )
+}
+
+// ─── Main Room Component ─────────────────────────────────────────────────────
 
 export function PlayBytRoom({ config, onLeave }: PlayBytRoomProps) {
   const [client, setClient] = useState<StreamVideoClient | null>(null)
@@ -53,7 +167,7 @@ export function PlayBytRoom({ config, onLeave }: PlayBytRoomProps) {
     },
   ])
 
-  const apiKey = import.meta.env.VITE_STREAM_API_KEY
+  const apiKey = config.apiKey || import.meta.env.VITE_STREAM_API_KEY
 
   useEffect(() => {
     const streamClient = new StreamVideoClient({
@@ -63,16 +177,18 @@ export function PlayBytRoom({ config, onLeave }: PlayBytRoomProps) {
     })
 
     const streamCall = streamClient.call('default', config.callId)
-    streamCall.join({ create: false }).catch(() => {
-      streamCall.join({ create: true })
+
+    // Properly await the join — using create:true is safe (joins if exists, creates if not)
+    streamCall.join({ create: true }).catch(err => {
+      console.error('[PlayByt] Failed to join call:', err)
     })
 
     setClient(streamClient)
     setCall(streamCall)
 
     return () => {
-      streamCall.leave()
-      streamClient.disconnectUser()
+      streamCall.leave().catch(() => {})
+      streamClient.disconnectUser().catch(() => {})
     }
   }, [config, apiKey])
 
@@ -153,8 +269,20 @@ function RoomLayout({ config, commentary, addCommentary, onLeave }: RoomLayoutPr
   const [elapsed, setElapsed] = useState(0)
   const [agentSpeaking, setAgentSpeaking] = useState(false)
   const [highlights, setHighlights] = useState<Highlight[]>([])
+  const [analysis, setAnalysis] = useState<AnalysisData | null>(null)
+  const [controversies, setControversies] = useState<ControversyEvent[]>([])
+  const [toasts, setToasts] = useState<ToastItem[]>([])
+  const [agentStatus, setAgentStatus] = useState<AgentStatus | null>(null)
+  const [chatInput, setChatInput] = useState('')
+  const seenControversyCount = useRef(0)
+  const toastIdCounter = useRef(0)
   const addRef = useRef(addCommentary)
   addRef.current = addCommentary
+  const prevParticipantCount = useRef(participants.length)
+  const lastKnownAgentParticipant = useRef<typeof participants[0] | null>(null)
+  const lastTranscriptId = useRef(0)
+  // Stable waveform heights — updated via interval, not in render
+  const [waveHeights, setWaveHeights] = useState([8, 12, 16, 10, 14])
 
   // Uptime timer
   useEffect(() => {
@@ -172,21 +300,119 @@ function RoomLayout({ config, commentary, addCommentary, onLeave }: RoomLayoutPr
           setHighlights(data.highlights || [])
         }
       } catch { /* ignore */ }
+    }, 2000)
+    return () => clearInterval(poll)
+  }, [])
+
+  // Poll field analysis for tactical map
+  useEffect(() => {
+    const poll = setInterval(async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/analysis`)
+        if (res.ok) {
+          const data: AnalysisData = await res.json()
+          if (data.player_count > 0) setAnalysis(data)
+        }
+      } catch { /* ignore */ }
+    }, 2000)
+    return () => clearInterval(poll)
+  }, [])
+
+  // Poll controversies and fire toasts for new ones
+  useEffect(() => {
+    const poll = setInterval(async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/controversies`)
+        if (res.ok) {
+          const data = await res.json()
+          const events: ControversyEvent[] = data.controversies || []
+          setControversies(events)
+          const newOnes = events.slice(seenControversyCount.current)
+          if (newOnes.length > 0) {
+            seenControversyCount.current = events.length
+            newOnes.forEach(ev => {
+              const toastId = ++toastIdCounter.current
+              setToasts(prev => [...prev, { id: toastId, title: ev.title, description: ev.description, type: ev.type }])
+              setTimeout(() => setToasts(prev => prev.filter(t => t.id !== toastId)), 5000)
+            })
+          }
+        }
+      } catch { /* ignore */ }
+    }, 2000)
+    return () => clearInterval(poll)
+  }, [])
+
+  // Poll agent transcript — feed AI speech into commentary
+  useEffect(() => {
+    const poll = setInterval(async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/transcript?since_id=${lastTranscriptId.current}`)
+        if (res.ok) {
+          const data = await res.json()
+          const lines: TranscriptLine[] = data.transcript || []
+          lines.forEach(line => {
+            if (line.id > lastTranscriptId.current) {
+              lastTranscriptId.current = line.id
+              addRef.current({
+                type: line.source === 'agent' ? 'playbyt' : 'user',
+                text: line.text,
+                user: line.source === 'user' ? 'You' : undefined,
+              })
+            }
+          })
+        }
+      } catch { /* ignore */ }
+    }, 2000)
+    return () => clearInterval(poll)
+  }, [])
+
+  // Poll real agent status (Gemini, YOLO, commentary loop)
+  useEffect(() => {
+    const poll = setInterval(async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/status`)
+        if (res.ok) {
+          const data: AgentStatus = await res.json()
+          setAgentStatus(data)
+        }
+      } catch { /* ignore */ }
     }, 3000)
     return () => clearInterval(poll)
   }, [])
 
+  // Waveform animation — update heights in an interval, NOT in render
+  useEffect(() => {
+    if (!agentSpeaking) return
+    const t = setInterval(() => {
+      setWaveHeights([0, 1, 2, 3, 4].map(() => 6 + Math.random() * 14))
+    }, 150)
+    return () => clearInterval(t)
+  }, [agentSpeaking])
+
   // Track PlayByt speaking state
-  const agentParticipantEarly = participants.find(p => p.userId === 'playbyt-agent')
+  const agentParticipantEarly = participants.find(p =>
+    p.userId === 'playbyt-agent' ||
+    p.userId?.startsWith('playbyt') ||
+    p.name?.toLowerCase() === 'playbyt'
+  )
   const speaking = agentParticipantEarly?.isSpeaking ?? false
   const prevSpeaking = useRef(false)
   useEffect(() => {
     setAgentSpeaking(speaking)
-    if (speaking && !prevSpeaking.current) {
-      addRef.current({ type: 'playbyt', text: '🎙️ PlayByt is speaking...' })
-    }
     prevSpeaking.current = speaking
   }, [speaking])
+
+  // Track participant count changes
+  useEffect(() => {
+    const prev = prevParticipantCount.current
+    const curr = participants.length
+    if (curr > prev && prev > 0) {
+      addRef.current({ type: 'event', text: `👥 A new participant joined (${curr} in room)` })
+    } else if (curr < prev && prev > 0) {
+      addRef.current({ type: 'event', text: `👥 A participant left (${curr} in room)` })
+    }
+    prevParticipantCount.current = curr
+  }, [participants.length])
 
   // Listen for call events → populate commentary feed
   useEffect(() => {
@@ -247,12 +473,56 @@ function RoomLayout({ config, commentary, addCommentary, onLeave }: RoomLayoutPr
     setIsScreenSharing(!isScreenSharing)
   }
 
-  // The PlayByt agent participant
-  const agentParticipant = participants.find(p => p.userId === 'playbyt-agent')
+  async function exportReport() {
+    try {
+      const res = await fetch(`${API_BASE}/api/report`)
+      if (res.ok) {
+        const data = await res.json()
+        const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement('a')
+        a.href = url
+        a.download = `playbyt-report-${new Date().toISOString().slice(0, 10)}.json`
+        a.click()
+        URL.revokeObjectURL(url)
+      } else {
+        alert('No report yet. Ask PlayByt: "Export a match report"')
+      }
+    } catch {
+      alert('Report not available. Ask PlayByt to export one first.')
+    }
+  }
+
+  // The PlayByt agent participant — match on id OR name (SDK may suffix session id)
+  const agentParticipant = participants.find(p =>
+    p.userId === 'playbyt-agent' ||
+    p.userId?.startsWith('playbyt') ||
+    p.name?.toLowerCase() === 'playbyt'
+  )
+  // Keep last known agent participant so split doesn't collapse on brief network blips
+  if (agentParticipant) lastKnownAgentParticipant.current = agentParticipant
+  const effectiveAgentParticipant = agentParticipant ?? lastKnownAgentParticipant.current
   // Screen-sharing participant (could be anyone)
   const screenShareParticipant = participants.find(p => hasScreenShare(p))
-  // Other human participants (exclude screen share duplicates)
-  const humanParticipants = participants.filter(p => p.userId !== 'playbyt-agent' && !hasScreenShare(p))
+  // Other human participants (exclude agent and screen share duplicates)
+  const humanParticipants = participants.filter(p =>
+    !p.userId?.startsWith('playbyt') &&
+    p.name?.toLowerCase() !== 'playbyt' &&
+    !hasScreenShare(p)
+  )
+  // Local user participant (for split view when no screen share)
+  const localParticipant = participants.find(p => p.isLocalParticipant)
+
+  // Wait until fully joined — useParticipants() returns empty while JOINING
+  if (callingState !== CallingState.JOINED && callingState !== CallingState.RECONNECTING) {
+    return (
+      <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--bg-primary)', flexDirection: 'column', gap: '16px' }}>
+        <div style={{ width: '48px', height: '48px', border: '3px solid rgba(0,255,136,0.2)', borderTop: '3px solid #00ff88', borderRadius: '50%', animation: 'spin 1s linear infinite' }} />
+        <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+        <p style={{ color: 'var(--text-secondary)' }}>Joining call...</p>
+      </div>
+    )
+  }
 
   return (
     <div style={{
@@ -261,6 +531,8 @@ function RoomLayout({ config, commentary, addCommentary, onLeave }: RoomLayoutPr
       display: 'flex',
       flexDirection: 'column',
     }}>
+      {/* SDK-managed audio — uses call.bindAudioElement() for correct playback */}
+      <ParticipantsAudio participants={participants} />
       {/* Header */}
       <header style={{
         display: 'flex',
@@ -325,9 +597,6 @@ function RoomLayout({ config, commentary, addCommentary, onLeave }: RoomLayoutPr
           }}>
             🎙️ {config.userName}
           </div>
-          <span style={{ color: 'var(--text-secondary)', fontSize: '12px' }}>
-            {callingState}
-          </span>
         </div>
       </header>
 
@@ -342,107 +611,146 @@ function RoomLayout({ config, commentary, addCommentary, onLeave }: RoomLayoutPr
         overflow: 'hidden',
       }}>
         {/* LEFT: Video grid */}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', overflow: 'hidden' }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', overflow: 'hidden', minHeight: 0 }}>
 
           {/* PlayByt agent video (main screen = YOLO annotated video) */}
-          <div style={{
-            flex: (agentParticipant || screenShareParticipant) ? '2' : '1',
-            background: 'var(--bg-card)',
-            borderRadius: '16px',
-            border: `1px solid ${screenShareParticipant ? 'rgba(68,136,255,0.3)' : 'rgba(0,255,136,0.15)'}`,
-            overflow: 'hidden',
-            position: 'relative',
-            minHeight: '200px',
-          }}>
-            {screenShareParticipant ? (
-              <>
+          {effectiveAgentParticipant ? (
+            /* ── SPLIT VIEW — always show when agent is in the call ── */
+            <div style={{
+              flex: 1,
+              display: 'grid',
+              gridTemplateColumns: '1fr 1fr',
+              gap: '8px',
+              minHeight: 0,
+            }}>
+              {/* Left panel: Screen share (if active) or user's camera */}
+              <div style={{
+                background: 'var(--bg-card)',
+                borderRadius: '12px',
+                border: `1px solid ${screenShareParticipant ? 'rgba(68,136,255,0.3)' : 'rgba(153,102,255,0.25)'}`,
+                overflow: 'hidden',
+                position: 'relative',
+              }}>
+                {screenShareParticipant ? (
+                  <>
+                    <div style={{ width: '100%', height: '100%' }}>
+                      <ParticipantView participant={screenShareParticipant} />
+                    </div>
+                    <div style={{
+                      position: 'absolute', top: '8px', left: '8px',
+                      background: 'rgba(0,0,0,0.75)', backdropFilter: 'blur(4px)',
+                      border: '1px solid rgba(68,136,255,0.4)', borderRadius: '6px',
+                      padding: '4px 10px', fontSize: '11px', color: '#4488ff', fontWeight: '700',
+                    }}>
+                      📺 RAW FEED
+                    </div>
+                  </>
+                ) : localParticipant ? (
+                  <>
+                    <div style={{ width: '100%', height: '100%' }}>
+                      <ParticipantView participant={localParticipant} />
+                    </div>
+                    <div style={{
+                      position: 'absolute', top: '8px', left: '8px',
+                      background: 'rgba(0,0,0,0.75)', backdropFilter: 'blur(4px)',
+                      border: '1px solid rgba(153,102,255,0.4)', borderRadius: '6px',
+                      padding: '4px 10px', fontSize: '11px', color: '#9966ff', fontWeight: '700',
+                    }}>
+                      📹 YOUR CAM
+                    </div>
+                  </>
+                ) : (
+                  <div style={{
+                    height: '100%', display: 'flex', flexDirection: 'column',
+                    alignItems: 'center', justifyContent: 'center', gap: '8px',
+                  }}>
+                    <span style={{ fontSize: '28px' }}>📺</span>
+                    <p style={{ color: 'var(--text-secondary)', fontSize: '12px', textAlign: 'center', padding: '0 16px' }}>
+                      Share your screen to show the game feed
+                    </p>
+                  </div>
+                )}
+              </div>
+              {/* Right panel: Agent's YOLO annotated feed */}
+              <div style={{
+                background: 'var(--bg-card)',
+                borderRadius: '12px',
+                border: '1px solid rgba(0,255,136,0.3)',
+                overflow: 'hidden',
+                position: 'relative',
+              }}>
                 <div style={{ width: '100%', height: '100%' }}>
-                  <ParticipantView participant={screenShareParticipant} />
+                  <ParticipantView participant={effectiveAgentParticipant!} />
                 </div>
                 <div style={{
-                  position: 'absolute',
-                  top: '12px',
-                  left: '12px',
-                  background: 'rgba(0,0,0,0.7)',
-                  backdropFilter: 'blur(4px)',
-                  border: '1px solid rgba(68,136,255,0.3)',
-                  borderRadius: '8px',
-                  padding: '6px 12px',
-                  fontSize: '12px',
-                  color: '#4488ff',
-                  fontWeight: '700',
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '6px',
-                }}>
-                  📺 Screen Share · Game Feed
-                </div>
-              </>
-            ) : agentParticipant ? (
-              <>
-                <div style={{ width: '100%', height: '100%' }}>
-                  <ParticipantView participant={agentParticipant} />
-                </div>
-                <div style={{
-                  position: 'absolute',
-                  top: '12px',
-                  left: '12px',
-                  background: 'rgba(0,0,0,0.7)',
-                  backdropFilter: 'blur(4px)',
-                  border: '1px solid rgba(0,255,136,0.3)',
-                  borderRadius: '8px',
-                  padding: '6px 12px',
-                  fontSize: '12px',
-                  color: '#00ff88',
-                  fontWeight: '700',
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '6px',
+                  position: 'absolute', top: '8px', left: '8px',
+                  background: 'rgba(0,0,0,0.75)', backdropFilter: 'blur(4px)',
+                  border: '1px solid rgba(0,255,136,0.4)', borderRadius: '6px',
+                  padding: '4px 10px', fontSize: '11px', color: '#00ff88', fontWeight: '700',
+                  display: 'flex', alignItems: 'center', gap: '4px',
                 }}>
                   <span style={{ animation: 'pulse 2s infinite', display: 'inline-block' }}>●</span>
-                  PlayByt AI · YOLO Active
+                  PlayByt
                 </div>
-              </>
-            ) : (
-              <div style={{
-                height: '100%',
-                display: 'flex',
-                flexDirection: 'column',
-                alignItems: 'center',
-                justifyContent: 'center',
-                gap: '12px',
-                minHeight: '200px',
-              }}>
-                <div style={{
-                  width: '64px',
-                  height: '64px',
-                  background: 'rgba(0,255,136,0.08)',
-                  borderRadius: '50%',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  fontSize: '28px',
-                }}>🤖</div>
-                <p style={{ color: 'var(--text-secondary)', fontSize: '14px' }}>
-                  Waiting for PlayByt agent to join...
-                </p>
-                <p style={{ color: 'var(--text-secondary)', fontSize: '12px' }}>
-                  Run: <code style={{ color: '#00ff88', background: 'rgba(0,255,136,0.1)', padding: '2px 6px', borderRadius: '4px' }}>
-                    python main.py run
-                  </code>
-                </p>
               </div>
-            )}
-          </div>
+            </div>
+          ) : (
+            /* ── SINGLE VIEW — waiting for agent to join ── */
+            <div style={{
+              flex: 1,
+              background: 'var(--bg-card)',
+              borderRadius: '16px',
+              border: '1px solid rgba(0,255,136,0.15)',
+              overflow: 'hidden',
+              position: 'relative',
+              display: 'flex',
+              minHeight: 0,
+            }}>
+              {screenShareParticipant ? (
+                <>
+                  <div style={{ width: '100%', height: '100%' }}>
+                    <ParticipantView participant={screenShareParticipant} />
+                  </div>
+                  <div style={{
+                    position: 'absolute', top: '12px', left: '12px',
+                    background: 'rgba(0,0,0,0.7)', backdropFilter: 'blur(4px)',
+                    border: '1px solid rgba(68,136,255,0.3)', borderRadius: '8px',
+                    padding: '6px 12px', fontSize: '12px', color: '#4488ff', fontWeight: '700',
+                  }}>
+                    📺 Screen Share · Waiting for AI
+                  </div>
+                </>
+              ) : (
+                <div style={{
+                  width: '100%', display: 'flex', flexDirection: 'column',
+                  alignItems: 'center', justifyContent: 'center', gap: '12px',
+                }}>
+                  <div style={{
+                    width: '64px', height: '64px',
+                    background: 'rgba(0,255,136,0.08)', borderRadius: '50%',
+                    display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '28px',
+                  }}>🤖</div>
+                  <p style={{ color: 'var(--text-secondary)', fontSize: '14px' }}>
+                    Waiting for PlayByt agent to join...
+                  </p>
+                  <p style={{ color: 'var(--text-secondary)', fontSize: '12px' }}>
+                    Run: <code style={{ color: '#00ff88', background: 'rgba(0,255,136,0.1)', padding: '2px 6px', borderRadius: '4px' }}>
+                      python main.py run
+                    </code>
+                  </p>
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Human participants grid */}
           {humanParticipants.length > 0 && (
             <div style={{
-              flex: '1',
+              flexShrink: 0,
               display: 'grid',
               gridTemplateColumns: `repeat(${Math.min(humanParticipants.length, 3)}, 1fr)`,
               gap: '8px',
-              maxHeight: '160px',
+              height: '120px',
             }}>
               {humanParticipants.map(p => (
                 <div key={p.sessionId} style={{
@@ -543,11 +851,23 @@ function RoomLayout({ config, commentary, addCommentary, onLeave }: RoomLayoutPr
               }}>{formatUptime(elapsed)}</span>
             </div>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px' }}>
-              {[
-                { label: 'Gemini', value: agentParticipantEarly ? '● Connected' : '○ Waiting', color: agentParticipantEarly ? '#00ff88' : '#888' },
-                { label: 'Sports Intel', value: agentParticipantEarly ? '● Active' : '○ Standby', color: agentParticipantEarly ? '#ffaa00' : '#888' },
-                { label: 'YOLO + HUD', value: agentParticipantEarly ? '● Tracking' : '○ Standby', color: agentParticipantEarly ? '#00ff88' : '#888' },
-                { label: 'Users', value: `${participants.length} in call`, color: '#9966ff' },
+              {[{
+                  label: 'Gemini',
+                  value: agentStatus?.gemini === 'connected' ? '● Connected' : agentParticipantEarly ? '● In Call' : '○ Waiting',
+                  color: agentStatus?.gemini === 'connected' ? '#00ff88' : agentParticipantEarly ? '#ffaa00' : '#888',
+                }, {
+                  label: 'Commentary',
+                  value: agentStatus?.commentary_loop === 'active' ? '● Live' : agentStatus?.commentary_loop === 'starting' ? '◐ Starting' : '○ Off',
+                  color: agentStatus?.commentary_loop === 'active' ? '#00ff88' : agentStatus?.commentary_loop === 'starting' ? '#ffaa00' : '#888',
+                }, {
+                  label: 'YOLO + HUD',
+                  value: agentStatus?.yolo === 'active' ? '● Tracking' : agentParticipantEarly ? '● Ready' : '○ Standby',
+                  color: agentStatus?.yolo === 'active' ? '#00ff88' : agentParticipantEarly ? '#ffaa00' : '#888',
+                }, {
+                  label: 'Users',
+                  value: `${participants.length} in call`,
+                  color: '#9966ff',
+                },
               ].map(s => (
                 <div key={s.label} style={{
                   background: 'var(--bg-secondary)',
@@ -595,12 +915,10 @@ function RoomLayout({ config, commentary, addCommentary, onLeave }: RoomLayoutPr
                   width: '3px',
                   borderRadius: '2px',
                   background: agentSpeaking ? '#00ff88' : '#333',
-                  height: agentSpeaking ? `${8 + Math.random() * 12}px` : '4px',
+                  height: agentSpeaking ? `${waveHeights[i]}px` : '4px',
                   transition: 'height 0.15s, background 0.3s',
-                  animation: agentSpeaking ? `wave 0.5s ease-in-out ${i * 0.1}s infinite alternate` : 'none',
                 }} />
               ))}
-              <style>{`@keyframes wave { from { height: 4px; } to { height: 18px; } }`}</style>
             </div>
             <div>
               <div style={{ fontSize: '12px', fontWeight: '700', color: agentSpeaking ? '#00ff88' : 'var(--text-secondary)' }}>
@@ -611,6 +929,69 @@ function RoomLayout({ config, commentary, addCommentary, onLeave }: RoomLayoutPr
               </div>
             </div>
           </div>
+
+          {/* ── Tactical Map ── */}
+          <div style={{
+            background: 'var(--bg-card)',
+            border: '1px solid var(--border)',
+            borderRadius: '12px',
+            padding: '10px 14px',
+            flexShrink: 0,
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '8px' }}>
+              <span style={{ fontSize: '13px' }}>🗺</span>
+              <span style={{ fontWeight: '700', fontSize: '12px', color: 'var(--text-primary)' }}>Tactical Map</span>
+              {analysis && (
+                <span style={{ marginLeft: 'auto', fontSize: '10px', color: '#4488ff', fontWeight: '700' }}>
+                  {analysis.formation} · {analysis.pressing_intensity.toUpperCase()}
+                </span>
+              )}
+            </div>
+            <TacticalMap analysis={analysis} />
+          </div>
+
+          {/* ── Controversy Alerts ── */}
+          {controversies.length > 0 && (
+            <div style={{
+              background: 'var(--bg-card)',
+              border: '1px solid rgba(255,170,0,0.2)',
+              borderRadius: '12px',
+              padding: '10px 14px',
+              flexShrink: 0,
+              maxHeight: '140px',
+              display: 'flex',
+              flexDirection: 'column',
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '8px' }}>
+                <span style={{ fontSize: '13px' }}>🚨</span>
+                <span style={{ fontWeight: '700', fontSize: '12px', color: 'var(--text-primary)' }}>Alerts</span>
+                <span style={{ marginLeft: 'auto', fontSize: '10px', color: '#ffaa00', fontWeight: '700' }}>
+                  {controversies.length} detected
+                </span>
+              </div>
+              <div style={{ overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                {controversies.slice(-4).map(c => (
+                  <div key={c.id} style={{
+                    background: 'rgba(255,170,0,0.05)',
+                    border: '1px solid rgba(255,170,0,0.12)',
+                    borderRadius: '6px',
+                    padding: '5px 8px',
+                    display: 'flex',
+                    gap: '8px',
+                    alignItems: 'flex-start',
+                  }}>
+                    <span style={{ fontFamily: 'monospace', fontSize: '9px', color: '#ffaa00', fontWeight: '700', flexShrink: 0, marginTop: '2px' }}>
+                      {Math.floor(c.elapsed / 60).toString().padStart(2, '0')}:{(c.elapsed % 60).toString().padStart(2, '0')}
+                    </span>
+                    <div>
+                      <div style={{ fontSize: '10px', fontWeight: '700', color: 'var(--text-primary)' }}>{c.title}</div>
+                      <div style={{ fontSize: '10px', color: 'var(--text-secondary)', lineHeight: '1.3' }}>{c.description}</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
 
           {/* ── Highlights Timeline ── */}
           <div style={{
@@ -632,6 +1013,22 @@ function RoomLayout({ config, commentary, addCommentary, onLeave }: RoomLayoutPr
                 color: '#ffaa00',
                 fontWeight: '700',
               }}>{highlights.length} logged</span>
+              <button
+                onClick={exportReport}
+                title="Export post-match report as JSON"
+                style={{
+                  background: 'rgba(0,255,136,0.08)',
+                  border: '1px solid rgba(0,255,136,0.2)',
+                  borderRadius: '6px',
+                  padding: '2px 8px',
+                  color: '#00ff88',
+                  fontSize: '10px',
+                  fontWeight: '700',
+                  cursor: 'pointer',
+                  flexShrink: 0,
+                }}>
+                📄 Export
+              </button>
             </div>
             {highlights.length === 0 ? (
               <p style={{ fontSize: '11px', color: 'var(--text-secondary)', textAlign: 'center', padding: '8px 0' }}>
@@ -752,12 +1149,101 @@ function RoomLayout({ config, commentary, addCommentary, onLeave }: RoomLayoutPr
               borderTop: '1px solid var(--border)',
               flexShrink: 0,
             }}>
-              <p style={{ fontSize: '11px', color: 'var(--text-secondary)', textAlign: 'center', lineHeight: '1.4' }}>
-                📺 Share screen → 🎤 Unmute → PlayByt catches what you miss
-              </p>
+              <form
+                onSubmit={async (e) => {
+                  e.preventDefault()
+                  const msg = chatInput.trim()
+                  if (!msg) return
+                  setChatInput('')
+                  // Send question to backend — it will appear in the Live Feed
+                  // via transcript polling (no local addCommentary to avoid duplicates)
+                  try {
+                    await fetch(`${API_BASE}/api/ask`, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ question: msg, user: config.userName }),
+                    })
+                  } catch {
+                    // If backend unreachable, show locally as fallback
+                    addRef.current({ type: 'user', text: msg, user: config.userName })
+                  }
+                }}
+                style={{ display: 'flex', gap: '6px' }}
+              >
+                <input
+                  type="text"
+                  value={chatInput}
+                  onChange={(e) => setChatInput(e.target.value)}
+                  placeholder="Ask PlayByt anything..."
+                  style={{
+                    flex: 1,
+                    background: 'var(--bg-secondary)',
+                    border: '1px solid var(--border)',
+                    borderRadius: '8px',
+                    padding: '8px 12px',
+                    fontSize: '12px',
+                    color: 'var(--text-primary)',
+                    outline: 'none',
+                  }}
+                />
+                <button
+                  type="submit"
+                  style={{
+                    background: 'rgba(0,255,136,0.1)',
+                    border: '1px solid rgba(0,255,136,0.3)',
+                    borderRadius: '8px',
+                    padding: '8px 12px',
+                    color: '#00ff88',
+                    fontSize: '12px',
+                    fontWeight: '700',
+                    cursor: 'pointer',
+                    flexShrink: 0,
+                  }}
+                >
+                  Send
+                </button>
+              </form>
             </div>
           </div>
         </div>
+      </div>
+
+      {/* ── Toast Notifications ── */}
+      <div style={{
+        position: 'fixed',
+        bottom: '24px',
+        right: '24px',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '8px',
+        zIndex: 1000,
+        pointerEvents: 'none',
+      }}>
+        {toasts.map(toast => (
+          <div key={toast.id} style={{
+            background: 'rgba(20,20,30,0.97)',
+            border: `1px solid ${
+              toast.type === 'pressing_spike' ? 'rgba(0,255,136,0.5)' :
+              toast.type === 'fatigue_spike' ? 'rgba(255,100,100,0.5)' :
+              toast.type === 'formation_change' ? 'rgba(68,136,255,0.5)' :
+              'rgba(255,170,0,0.5)'
+            }`,
+            borderRadius: '12px',
+            padding: '10px 16px',
+            minWidth: '260px',
+            maxWidth: '320px',
+            boxShadow: '0 4px 24px rgba(0,0,0,0.5)',
+            animation: 'fadeIn 0.3s ease',
+            pointerEvents: 'auto',
+          }}>
+            <div style={{ fontWeight: '700', fontSize: '13px', color: 'var(--text-primary)', marginBottom: '3px' }}>
+              {toast.title}
+            </div>
+            <div style={{ fontSize: '11px', color: 'var(--text-secondary)', lineHeight: '1.4' }}>
+              {toast.description}
+            </div>
+          </div>
+        ))}
       </div>
     </div>
   )

@@ -64,13 +64,14 @@ export function JoinRoom({ onJoin }: JoinRoomProps) {
 
     try {
       const userId = `user-${userName.toLowerCase().replace(/\s+/g, '-')}-${Date.now()}`
-      const { token: userToken } = await getToken(userId, userName.trim())
+      const { token: userToken, api_key: apiKey } = await getToken(userId, userName.trim())
 
       onJoin({
         callId: callId.trim(),
         userName: userName.trim(),
         userId,
         userToken,
+        apiKey,
         role,
       })
     } catch {
