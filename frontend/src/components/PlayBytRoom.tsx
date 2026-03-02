@@ -542,8 +542,9 @@ function RoomLayout({ config, commentary, addCommentary, removeCommentaryById, a
   const effectiveAgentParticipant = agentParticipant ?? lastKnownAgentParticipant.current
   // Screen-sharing participant (could be anyone)
   const screenShareParticipant = participants.find(p => hasScreenShare(p))
-  // Derive from actual SDK state — syncs with browser's native 'Stop sharing' button too
+  // Local participant — used for split view and deriving isScreenSharing from SDK state
   const localParticipant = participants.find(p => p.isLocalParticipant)
+  // Derive from actual SDK state — syncs with browser's native 'Stop sharing' button too
   const isScreenSharing = !!(localParticipant && hasScreenShare(localParticipant))
   // Other human participants (exclude agent, screen share, and local user since they're in the split view)
   const humanParticipants = participants.filter(p =>
@@ -552,8 +553,6 @@ function RoomLayout({ config, commentary, addCommentary, removeCommentaryById, a
     !hasScreenShare(p) &&
     !p.isLocalParticipant
   )
-  // Local user participant (for split view when no screen share)
-  const localParticipant = participants.find(p => p.isLocalParticipant)
 
   // Wait until fully joined — useParticipants() returns empty while JOINING
   if (callingState !== CallingState.JOINED && callingState !== CallingState.RECONNECTING) {
