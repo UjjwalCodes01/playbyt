@@ -187,47 +187,6 @@ async def _patched_stream_on_track_removed(self, event):
 _stream_edge.StreamEdge._on_track_removed = _patched_stream_on_track_removed
 # ──────────────────────────────────────────────────────────────────────────────
 
-# ── SDK monkey-patch: _on_track_published — retry on TimeoutError ───────────
-# The SDK polls _pending_tracks for 10s waiting for the WebRTC RTP track to
-# arrive after a SFU TrackPublished signal.  On re-join / slow ICE, the RTP
-# track arrives AFTER the 10s window → TimeoutError.
-#
-# Key insight from SDK source: _pending_tracks is NOT cleared on timeout.
-# The WebRTC on_track callback populates it independently. So if we simply
-# retry _on_track_published after a short delay, the entry will already be
-# in _pending_tracks and the first poll iteration finds it immediately.
-#
-# We retry up to 4 times (5s apart) giving a 50s total window — enough for
-# any realistic ICE negotiation to complete.
-_orig_on_track_published = _stream_edge.StreamEdge._on_track_published
-
-async def _patched_on_track_published(self, event):
-    _RETRIES = 4
-    _RETRY_DELAY = 5  # seconds between attempts
-    for attempt in range(_RETRIES + 1):
-        try:
-            await _orig_on_track_published(self, event)
-            if attempt > 0:
-                logger.info("✅ Track published (succeeded on attempt %d)", attempt + 1)
-            return  # success
-        except TimeoutError:
-            if attempt < _RETRIES:
-                logger.warning(
-                    "⚠️ Track publish timeout (attempt %d/%d) — ICE still negotiating, "
-                    "retrying in %ds", attempt + 1, _RETRIES + 1, _RETRY_DELAY,
-                )
-                await asyncio.sleep(_RETRY_DELAY)
-            else:
-                logger.error(
-                    "❌ Track publish failed after %d attempts — WebRTC track never arrived",
-                    _RETRIES + 1,
-                )
-        except Exception:
-            raise  # re-raise anything unexpected
-
-_stream_edge.StreamEdge._on_track_published = _patched_on_track_published
-# ──────────────────────────────────────────────────────────────────────────────
-
 # ── SDK monkey-patch: create_call ──────────────────────────────────────────────
 # The SDK's create_call passes data as a plain dict {"created_by_id": ...} which
 # the getstream REST client doesn't serialize the same way as a CallRequest
