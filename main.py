@@ -187,25 +187,43 @@ async def _patched_stream_on_track_removed(self, event):
 _stream_edge.StreamEdge._on_track_removed = _patched_stream_on_track_removed
 # ──────────────────────────────────────────────────────────────────────────────
 
-# ── SDK monkey-patch: _on_track_published — swallow TimeoutError ──────────────
-# The SDK's _on_track_published waits 10s for the WebRTC RTP track to arrive
-# after receiving a SFU signalling event.  If ICE negotiation is slow (common on
-# reconnect / re-join after a previous share session), it throws TimeoutError
-# which crashes the entire event handler and leaves the track permanently unset.
-# Patch to catch that and log a warning — the track will be re-published by the
-# SFU on the next offer/answer cycle, so this is a recoverable transient failure.
+# ── SDK monkey-patch: _on_track_published — retry on TimeoutError ───────────
+# The SDK polls _pending_tracks for 10s waiting for the WebRTC RTP track to
+# arrive after a SFU TrackPublished signal.  On re-join / slow ICE, the RTP
+# track arrives AFTER the 10s window → TimeoutError.
+#
+# Key insight from SDK source: _pending_tracks is NOT cleared on timeout.
+# The WebRTC on_track callback populates it independently. So if we simply
+# retry _on_track_published after a short delay, the entry will already be
+# in _pending_tracks and the first poll iteration finds it immediately.
+#
+# We retry up to 4 times (5s apart) giving a 50s total window — enough for
+# any realistic ICE negotiation to complete.
 _orig_on_track_published = _stream_edge.StreamEdge._on_track_published
 
 async def _patched_on_track_published(self, event):
-    try:
-        await _orig_on_track_published(self, event)
-    except TimeoutError as exc:
-        logger.warning(
-            "⚠️ Track publish timeout (WebRTC track never arrived, will retry on "
-            "next SFU offer): %s", exc
-        )
-    except Exception:
-        raise  # re-raise anything else
+    _RETRIES = 4
+    _RETRY_DELAY = 5  # seconds between attempts
+    for attempt in range(_RETRIES + 1):
+        try:
+            await _orig_on_track_published(self, event)
+            if attempt > 0:
+                logger.info("✅ Track published (succeeded on attempt %d)", attempt + 1)
+            return  # success
+        except TimeoutError:
+            if attempt < _RETRIES:
+                logger.warning(
+                    "⚠️ Track publish timeout (attempt %d/%d) — ICE still negotiating, "
+                    "retrying in %ds", attempt + 1, _RETRIES + 1, _RETRY_DELAY,
+                )
+                await asyncio.sleep(_RETRY_DELAY)
+            else:
+                logger.error(
+                    "❌ Track publish failed after %d attempts — WebRTC track never arrived",
+                    _RETRIES + 1,
+                )
+        except Exception:
+            raise  # re-raise anything unexpected
 
 _stream_edge.StreamEdge._on_track_published = _patched_on_track_published
 # ──────────────────────────────────────────────────────────────────────────────
@@ -262,14 +280,14 @@ PRESENCE_FILE = Path(__file__).parent / ".presence.json"
 
 # ── Presence Timeout ────────────────────────────────────────────────
 # How long to keep running after the last frontend heartbeat.
-# Frontend pings /api/presence every 20s. If no ping for 90s → room empty.
-_PRESENCE_TIMEOUT = 90.0
+# Frontend pings /api/presence every 20s.  3 missed pings (60s) → empty.
+_PRESENCE_TIMEOUT = 60.0
 
 
 def _room_has_users() -> bool:
     """Return True if at least one user is actively in the room.
     The frontend POSTs /api/presence every 20s while a user is connected.
-    If no heartbeat for 90 seconds we treat the room as empty and skip
+    If no heartbeat for 60 seconds we treat the room as empty and skip
     sending to Gemini — avoiding burning API credits when nobody is watching.
     """
     data = _safe_read_json(PRESENCE_FILE, fallback=None)
@@ -704,6 +722,11 @@ async def _send_to_gemini(agent: Agent, prompt: str, label: str) -> bool:
     Sets backoff on crash.
     """
     global _backoff_until
+    # Hard gate: never burn Gemini credits when nobody is in the room.
+    # This is the final safety net regardless of which loop calls us.
+    if not _room_has_users():
+        logger.debug("%s skipped — room empty, no Gemini call made", label)
+        return False
     if time.time() < _backoff_until:
         return False
     try:
@@ -986,9 +1009,11 @@ async def _question_loop(agent: Agent) -> None:
 def _setup_transcript_capture(agent: Agent) -> None:
     """
     Subscribe to the SDK's proper event system to capture agent speech.
-    Uses agent.llm.events.subscribe with type-hinted async handlers.
+    Falls back to a Union-typed handler if the SDK rejects single-event
+    subscription (SDK versions >= 0.4 require Union[EventType, ...]).
     User speech is NEVER captured — privacy first.
     """
+    # Attempt 1: single-event subscription (works on older SDK versions)
     try:
         @agent.llm.events.subscribe
         async def _on_agent_speech(
@@ -997,9 +1022,26 @@ def _setup_transcript_capture(agent: Agent) -> None:
             if event.text:
                 await _buffer_chunk(event.text)
 
-        logger.info("🎙️ Transcript capture hooked via SDK events")
+        logger.info("🎙️ Transcript capture hooked via SDK events (single-event)")
+        return
+    except Exception:
+        pass  # SDK rejected single-event — try Union form below
+
+    # Attempt 2: Union-typed handler (required by newer SDK versions)
+    try:
+        from typing import Union as _Union
+
+        @agent.llm.events.subscribe
+        async def _on_agent_speech_union(
+            event: _Union[RealtimeAgentSpeechTranscriptionEvent, None],
+        ) -> None:
+            if isinstance(event, RealtimeAgentSpeechTranscriptionEvent) and event.text:
+                await _buffer_chunk(event.text)
+
+        logger.info("🎙️ Transcript capture hooked via SDK events (union-event)")
+        return
     except Exception as e:
-        logger.warning("Transcript capture setup failed: %s", e)
+        logger.warning("Transcript capture setup failed (both methods): %s — transcripts may be missing", e)
 
 
 # ── Call Lifecycle ──────────────────────────────────────────────────────
@@ -1068,15 +1110,39 @@ async def join_call(agent: Agent, call_type: str, call_id: str, **kwargs) -> Non
 
         logger.info("PlayByt is live — starting commentary loop...")
 
+        async def _resilient(factory, name: str, restart_delay: float = 10.0):
+            """Run factory() as a coroutine, restarting on unexpected crashes.
+            This is a last-resort wrapper — each loop already handles its own
+            inner exceptions.  This catches anything that slips through.
+            """
+            while True:
+                try:
+                    await factory()
+                    return  # clean exit (e.g. CancelledError propagated)
+                except asyncio.CancelledError:
+                    raise  # always propagate cancellation
+                except Exception as exc:
+                    logger.error(
+                        "🔴 Loop '%s' crashed unexpectedly — restarting in %.0fs: %s",
+                        name, restart_delay, exc,
+                    )
+                    await asyncio.sleep(restart_delay)
+
         # Start commentary + event watcher + question loops
         commentary_task = None
         question_task = None
         event_task = None
         video_guard_task = None
         if sports:
-            commentary_task = asyncio.ensure_future(_commentary_loop(agent, sports))
-            event_task = asyncio.ensure_future(_event_watcher(agent, sports))
-            question_task = asyncio.ensure_future(_question_loop(agent))
+            commentary_task = asyncio.ensure_future(
+                _resilient(lambda: _commentary_loop(agent, sports), "commentary")
+            )
+            event_task = asyncio.ensure_future(
+                _resilient(lambda: _event_watcher(agent, sports), "event_watcher")
+            )
+            question_task = asyncio.ensure_future(
+                _resilient(lambda: _question_loop(agent), "question")
+            )
             logger.info("🎙️ Commentary + event watcher + question loops scheduled")
         else:
             logger.warning("No SportsProcessor found — commentary loop disabled")
@@ -1096,42 +1162,56 @@ async def join_call(agent: Agent, call_type: str, call_id: str, **kwargs) -> Non
             was_empty = False
             empty_since = 0.0
             while True:
-                await asyncio.sleep(10)
+                try:
+                    await asyncio.sleep(10)
 
-                video_active = getattr(agent.llm, "_video_forwarder", None) is not None
+                    video_active = getattr(agent.llm, "_video_forwarder", None) is not None
 
-                # ── Condition 1: room empty ──────────────────────────────────────
-                room_empty = not _room_has_users()
-                if room_empty and not was_empty:
-                    was_empty = True
-                    empty_since = time.time()
-                elif not room_empty:
-                    was_empty = False
-                    empty_since = 0.0
+                    # ── Condition 1: room empty ──────────────────────────────────
+                    room_empty = not _room_has_users()
+                    if room_empty and not was_empty:
+                        was_empty = True
+                        empty_since = time.time()
+                    elif not room_empty:
+                        was_empty = False
+                        empty_since = 0.0
 
-                if was_empty and (time.time() - empty_since) > 30 and video_active:
-                    await agent.llm.stop_watching_video_track()
-                    logger.info("🛑 Video guard: stopped Gemini video (room empty >30s)")
-                    continue  # re-evaluate next tick
+                    if was_empty and (time.time() - empty_since) > 30 and video_active:
+                        try:
+                            await agent.llm.stop_watching_video_track()
+                            logger.info("🛑 Video guard: stopped Gemini video (room empty >30s)")
+                        except Exception as exc:
+                            logger.warning("Video guard stop (empty room) failed: %s", exc)
+                        continue  # re-evaluate next tick
 
-                # ── Condition 2: screen share stopped (no frames for >30s) ───────
-                # sports.last_frame_time > 0 means we received at least one frame this
-                # session, so a stale timestamp means sharing genuinely stopped (vs the
-                # agent just starting up before any share began).
-                if (
-                    sports is not None
-                    and sports.last_frame_time > 0.0
-                    and video_active
-                ):
-                    frame_age = time.time() - sports.last_frame_time
-                    if frame_age > 30:
-                        await agent.llm.stop_watching_video_track()
-                        await sports.stop_processing()  # resets last_frame_time → 0.0
-                        logger.info(
-                            "🛑 Video guard: stopped Gemini video (no frames for %.0fs"
-                            " — screen share stopped)",
-                            frame_age,
-                        )
+                    # ── Condition 2: screen share stopped (no frames for >30s) ───
+                    # sports.last_frame_time > 0 means we received at least one frame
+                    # this session, so stale = sharing genuinely stopped.
+                    if (
+                        sports is not None
+                        and sports.last_frame_time > 0.0
+                        and video_active
+                    ):
+                        frame_age = time.time() - sports.last_frame_time
+                        if frame_age > 30:
+                            try:
+                                await agent.llm.stop_watching_video_track()
+                            except Exception as exc:
+                                logger.warning("Video guard stop_watching failed: %s", exc)
+                            try:
+                                await sports.stop_processing()  # resets last_frame_time → 0.0
+                            except Exception as exc:
+                                logger.warning("Video guard stop_processing failed: %s", exc)
+                            logger.info(
+                                "🛑 Video guard: stopped Gemini video (no frames for %.0fs"
+                                " — screen share stopped)",
+                                frame_age,
+                            )
+
+                except asyncio.CancelledError:
+                    raise  # always propagate cancellation cleanly
+                except Exception as exc:
+                    logger.warning("Video guard tick error (will retry): %s", exc)
 
         video_guard_task = asyncio.ensure_future(_video_guard())
 
