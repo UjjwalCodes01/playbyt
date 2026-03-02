@@ -187,6 +187,29 @@ async def _patched_stream_on_track_removed(self, event):
 _stream_edge.StreamEdge._on_track_removed = _patched_stream_on_track_removed
 # ──────────────────────────────────────────────────────────────────────────────
 
+# ── SDK monkey-patch: _on_track_published — swallow TimeoutError ──────────────
+# The SDK's _on_track_published waits 10s for the WebRTC RTP track to arrive
+# after receiving a SFU signalling event.  If ICE negotiation is slow (common on
+# reconnect / re-join after a previous share session), it throws TimeoutError
+# which crashes the entire event handler and leaves the track permanently unset.
+# Patch to catch that and log a warning — the track will be re-published by the
+# SFU on the next offer/answer cycle, so this is a recoverable transient failure.
+_orig_on_track_published = _stream_edge.StreamEdge._on_track_published
+
+async def _patched_on_track_published(self, event):
+    try:
+        await _orig_on_track_published(self, event)
+    except TimeoutError as exc:
+        logger.warning(
+            "⚠️ Track publish timeout (WebRTC track never arrived, will retry on "
+            "next SFU offer): %s", exc
+        )
+    except Exception:
+        raise  # re-raise anything else
+
+_stream_edge.StreamEdge._on_track_published = _patched_on_track_published
+# ──────────────────────────────────────────────────────────────────────────────
+
 # ── SDK monkey-patch: create_call ──────────────────────────────────────────────
 # The SDK's create_call passes data as a plain dict {"created_by_id": ...} which
 # the getstream REST client doesn't serialize the same way as a CallRequest
