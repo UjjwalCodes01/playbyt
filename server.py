@@ -28,6 +28,7 @@ REPORT_FILE = Path(__file__).parent / ".report.json"
 TRANSCRIPT_FILE = Path(__file__).parent / ".transcript.json"
 STATUS_FILE = Path(__file__).parent / ".status.json"
 QUESTIONS_FILE = Path(__file__).parent / ".questions.json"
+PRESENCE_FILE = Path(__file__).parent / ".presence.json"
 
 app = FastAPI(title="PlayByt API")
 
@@ -185,3 +186,14 @@ def ask_question(req: AskRequest):
     })
     _safe_write_json(QUESTIONS_FILE, questions)
     return {"status": "queued", "position": len(questions)}
+
+
+@app.post("/api/presence")
+def update_presence():
+    """Heartbeat from the frontend — tells the agent the room is occupied.
+    Called every 20 seconds while a user is in the room.
+    Agent pauses Gemini commentary 90 seconds after the last heartbeat.
+    """
+    import time as _time
+    _safe_write_json(PRESENCE_FILE, {"last_seen": _time.time()})
+    return {"status": "ok"}
