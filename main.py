@@ -1061,11 +1061,23 @@ async def join_call(agent: Agent, call_type: str, call_id: str, **kwargs) -> Non
         # Safety-net: stop Gemini video when room is empty even if SDK track
         # removal event was missed (e.g. participant_left with empty published_tracks)
         async def _video_guard():
-            """Kill video forwarding whenever the room has been empty for >30s."""
+            """Kill video forwarding when room is empty >30s OR screen share stopped >30s.
+
+            Two independent conditions are checked every 10s:
+            1. Room empty >30s — user left without the SDK firing a proper leave event.
+            2. No video frames received for >30s (sports.last_frame_time stale) while
+               Gemini still holds an active video forwarder — this is the "stopped screen
+               share but stayed in room" case.  Without this, Gemini keeps processing the
+               frozen last frame indefinitely and the commentary loop keeps firing on it.
+            """
             was_empty = False
             empty_since = 0.0
             while True:
                 await asyncio.sleep(10)
+
+                video_active = getattr(agent.llm, "_video_forwarder", None) is not None
+
+                # ── Condition 1: room empty ──────────────────────────────────────
                 room_empty = not _room_has_users()
                 if room_empty and not was_empty:
                     was_empty = True
@@ -1073,11 +1085,30 @@ async def join_call(agent: Agent, call_type: str, call_id: str, **kwargs) -> Non
                 elif not room_empty:
                     was_empty = False
                     empty_since = 0.0
-                # Stop video after 30s of confirmed emptiness
-                if was_empty and (time.time() - empty_since) > 30:
-                    if getattr(agent.llm, "_video_forwarder", None) is not None:
+
+                if was_empty and (time.time() - empty_since) > 30 and video_active:
+                    await agent.llm.stop_watching_video_track()
+                    logger.info("🛑 Video guard: stopped Gemini video (room empty >30s)")
+                    continue  # re-evaluate next tick
+
+                # ── Condition 2: screen share stopped (no frames for >30s) ───────
+                # sports.last_frame_time > 0 means we received at least one frame this
+                # session, so a stale timestamp means sharing genuinely stopped (vs the
+                # agent just starting up before any share began).
+                if (
+                    sports is not None
+                    and sports.last_frame_time > 0.0
+                    and video_active
+                ):
+                    frame_age = time.time() - sports.last_frame_time
+                    if frame_age > 30:
                         await agent.llm.stop_watching_video_track()
-                        logger.info("🛑 Video guard: stopped Gemini video (room empty >30s)")
+                        await sports.stop_processing()  # resets last_frame_time → 0.0
+                        logger.info(
+                            "🛑 Video guard: stopped Gemini video (no frames for %.0fs"
+                            " — screen share stopped)",
+                            frame_age,
+                        )
 
         video_guard_task = asyncio.ensure_future(_video_guard())
 

@@ -720,19 +720,33 @@ function RoomLayout({ config, commentary, addCommentary, removeCommentaryById, a
                 overflow: 'hidden',
                 position: 'relative',
               }}>
-                <div style={{ width: '100%', height: '100%' }}>
-                  <ParticipantView participant={effectiveAgentParticipant!} />
-                </div>
-                <div style={{
-                  position: 'absolute', top: '8px', left: '8px',
-                  background: 'rgba(0,0,0,0.75)', backdropFilter: 'blur(4px)',
-                  border: '1px solid rgba(0,255,136,0.4)', borderRadius: '6px',
-                  padding: '4px 10px', fontSize: '11px', color: '#00ff88', fontWeight: '700',
-                  display: 'flex', alignItems: 'center', gap: '4px',
-                }}>
-                  <span style={{ animation: 'pulse 2s infinite', display: 'inline-block' }}>●</span>
-                  PlayByt
-                </div>
+                {screenShareParticipant ? (
+                  <>
+                    <div style={{ width: '100%', height: '100%' }}>
+                      <ParticipantView participant={effectiveAgentParticipant!} />
+                    </div>
+                    <div style={{
+                      position: 'absolute', top: '8px', left: '8px',
+                      background: 'rgba(0,0,0,0.75)', backdropFilter: 'blur(4px)',
+                      border: '1px solid rgba(0,255,136,0.4)', borderRadius: '6px',
+                      padding: '4px 10px', fontSize: '11px', color: '#00ff88', fontWeight: '700',
+                      display: 'flex', alignItems: 'center', gap: '4px',
+                    }}>
+                      <span style={{ animation: 'pulse 2s infinite', display: 'inline-block' }}>●</span>
+                      PlayByt
+                    </div>
+                  </>
+                ) : (
+                  <div style={{
+                    height: '100%', display: 'flex', flexDirection: 'column',
+                    alignItems: 'center', justifyContent: 'center', gap: '8px',
+                  }}>
+                    <span style={{ fontSize: '28px' }}>🤖</span>
+                    <p style={{ color: 'var(--text-secondary)', fontSize: '12px', textAlign: 'center', padding: '0 16px' }}>
+                      PlayByt ready — share your screen to activate AI analysis
+                    </p>
+                  </div>
+                )}
               </div>
             </div>
           ) : (
