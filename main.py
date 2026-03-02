@@ -82,6 +82,56 @@ import types as _types
 _gemini_rt.GeminiRealtime._send_video_frame = _patched_send_video_frame
 # ──────────────────────────────────────────────────────────────────────────────
 
+# ── SDK monkey-patch: _processing_loop with exponential backoff ───────────────
+# The SDK's _processing_loop has no backoff in the generic `except Exception`
+# handler.  When Gemini returns APIError 1011 (service unavailable), it is NOT
+# a ConnectionClosedError so it bypasses _should_reconnect entirely — the loop
+# just logs the error and spins instantly → millions of log lines per minute.
+# Replace the loop with a version that: (a) sleeps before every retry, (b)
+# re-calls self.connect() to get a fresh WebSocket, (c) resets delay on success.
+from asyncio import CancelledError as _CancelledError
+
+_LOOP_DELAYS = [1, 2, 5, 10, 30, 60]  # seconds between retries
+
+async def _patched_processing_loop(self):
+    logger.debug("Start processing events from Gemini Live API")
+    _retry = 0
+    try:
+        while True:
+            try:
+                await self._process_events()
+                _retry = 0  # clean exit — reset backoff
+            except _CancelledError:
+                raise
+            except _ws.ConnectionClosedError as exc:
+                if not _gemini_rt._should_reconnect(exc):
+                    raise
+                delay = _LOOP_DELAYS[min(_retry, len(_LOOP_DELAYS) - 1)]
+                logger.warning(
+                    "Gemini WS closed (%s), reconnecting in %ds (attempt %d)",
+                    exc.rcvd.code if exc.rcvd else "?", delay, _retry + 1,
+                )
+                await asyncio.sleep(delay)
+                _retry += 1
+                await self.connect()
+            except Exception as exc:
+                delay = _LOOP_DELAYS[min(_retry, len(_LOOP_DELAYS) - 1)]
+                logger.error(
+                    "Gemini processing error (attempt %d), reconnecting in %ds: %s",
+                    _retry + 1, delay, exc,
+                )
+                await asyncio.sleep(delay)
+                _retry += 1
+                try:
+                    await self.connect()
+                except Exception:
+                    logger.exception("Reconnect after error failed — will retry")
+    except _CancelledError:
+        logger.debug("Processing loop has been cancelled")
+
+_gemini_rt.GeminiRealtime._processing_loop = _patched_processing_loop
+# ──────────────────────────────────────────────────────────────────────────────
+
 # ── SDK monkey-patch: create_call ──────────────────────────────────────────────
 # The SDK's create_call passes data as a plain dict {"created_by_id": ...} which
 # the getstream REST client doesn't serialize the same way as a CallRequest
