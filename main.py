@@ -31,6 +31,25 @@ from vision_agents.plugins.getstream.stream_edge_transport import StreamEdge
 
 from sports_processor import SportsProcessor
 
+# ── Torch thread limits ───────────────────────────────────────────────────────
+# By default PyTorch uses all available CPU cores for inference threads.
+# On a t2.small (1 vCPU) this causes massive context-switching overhead and
+# drains CPU burst credits within minutes. Capping at 1 keeps inference
+# sequential, halves per-inference memory (no thread stacks), and preserves
+# burst credits so the instance stays responsive.
+import os
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+try:
+    import torch
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
+except Exception:
+    pass
+# ──────────────────────────────────────────────────────────────────────────────
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
@@ -1174,17 +1193,45 @@ async def join_call(agent: Agent, call_type: str, call_id: str, **kwargs) -> Non
 
         video_guard_task = asyncio.ensure_future(_video_guard())
 
+        # ── Memory watchdog ───────────────────────────────────────────────────
+        # Runs periodic GC to return fragmented memory to OS, and kills the
+        # process cleanly if RSS exceeds 1.7 GB so the OS can restart it fresh
+        # rather than the OOM killer freezing the whole instance.
+        async def _memory_watchdog():
+            import gc
+            import resource
+            import sys as _sys
+            while True:
+                await asyncio.sleep(30)
+                try:
+                    gc.collect()
+                    rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024
+                    if rss_mb > 1700:
+                        logger.error(
+                            "💀 Memory watchdog: RSS %d MB > 1700 MB threshold — "
+                            "exiting cleanly so supervisor can restart", rss_mb
+                        )
+                        _sys.exit(1)
+                    elif rss_mb > 1400:
+                        logger.warning("⚠️  Memory watchdog: RSS %d MB (approaching limit)", rss_mb)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning("Memory watchdog error: %s", exc)
+
+        memory_watchdog_task = asyncio.ensure_future(_memory_watchdog())
+
         _shutdown = asyncio.Event()
         try:
             await _shutdown.wait()  # Block until cancelled — cleaner than Future()
         except asyncio.CancelledError:
             pass
         finally:
-            for task in (commentary_task, event_task, question_task, video_guard_task):
+            for task in (commentary_task, event_task, question_task, video_guard_task, memory_watchdog_task):
                 if task:
                     task.cancel()
             await asyncio.gather(
-                *(t for t in (commentary_task, event_task, question_task, video_guard_task) if t),
+                *(t for t in (commentary_task, event_task, question_task, video_guard_task, memory_watchdog_task) if t),
                 return_exceptions=True,
             )
             _update_status(gemini="disconnected", commentary_loop="stopped")

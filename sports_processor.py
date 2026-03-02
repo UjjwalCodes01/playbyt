@@ -194,9 +194,27 @@ class SportsProcessor(VideoProcessorPublisher):
                 pass
             return
 
-        # Step 2: YOLO pose detection
+        # Step 2: YOLO pose detection (resize to max 480px wide to cut compute ~4x)
         try:
-            annotated, pose_data = await self._yolo.add_pose_to_ndarray(frame_array)
+            h_orig, w_orig = frame_array.shape[:2]
+            _MAX_W = 480
+            if w_orig > _MAX_W:
+                scale = _MAX_W / w_orig
+                yolo_frame = cv2.resize(
+                    frame_array,
+                    (int(w_orig * scale), int(h_orig * scale)),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+            else:
+                yolo_frame = frame_array
+            annotated_small, pose_data = await self._yolo.add_pose_to_ndarray(yolo_frame)
+            # Scale annotated result back to original size for HUD display
+            if w_orig > _MAX_W:
+                annotated = cv2.resize(
+                    annotated_small, (w_orig, h_orig), interpolation=cv2.INTER_LINEAR
+                )
+            else:
+                annotated = annotated_small
         except Exception as e:
             self._error_count += 1
             self._consecutive_errors += 1
@@ -222,7 +240,9 @@ class SportsProcessor(VideoProcessorPublisher):
             self._analysis_history.append(analysis)
             if len(self._analysis_history) > 30:
                 self._analysis_history = self._analysis_history[-30:]
-            asyncio.ensure_future(self._persist_analysis(analysis))
+            # Only write to disk every 5th frame — avoids spawning 3 async tasks/sec
+            if self._frame_count % 5 == 0:
+                asyncio.ensure_future(self._persist_analysis(analysis))
             self._detect_controversies(analysis)
         except Exception as e:
             self._error_count += 1
