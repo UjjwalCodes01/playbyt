@@ -187,44 +187,6 @@ async def _patched_stream_on_track_removed(self, event):
 _stream_edge.StreamEdge._on_track_removed = _patched_stream_on_track_removed
 # ──────────────────────────────────────────────────────────────────────────────
 
-# ── SDK monkey-patch: _on_track_published — deferred retry on TimeoutError ────
-# Root cause (confirmed from logs): on re-join, the SFU fires TrackPublished
-# signalling BEFORE the WebRTC ICE/SDP negotiation completes.  The SDK polls
-# _pending_tracks for 10 s; if the RTP track hasn't arrived yet it throws
-# TimeoutError and the screen share track is permanently lost.
-#
-# Fix: catch TimeoutError, return immediately (don't block the event loop),
-# and spawn a one-shot background task that retries after 15 s.  By then ICE
-# is always done and _pending_tracks has the entry ready on the first poll.
-_orig_on_track_published = _stream_edge.StreamEdge._on_track_published
-
-async def _patched_on_track_published(self, event):
-    try:
-        await _orig_on_track_published(self, event)
-    except TimeoutError:
-        logger.warning(
-            "⚠️  Track publish timed out (WebRTC still negotiating) — "
-            "retrying in 15 s via background task"
-        )
-        async def _deferred():
-            await asyncio.sleep(15)
-            try:
-                await _orig_on_track_published(self, event)
-                logger.info("✅ Deferred track publish succeeded")
-            except TimeoutError:
-                logger.error(
-                    "❌ Deferred track publish also timed out — "
-                    "screen share track could not be registered"
-                )
-            except Exception as exc:
-                logger.error("❌ Deferred track publish error: %s", exc)
-        asyncio.create_task(_deferred())
-    except Exception:
-        raise
-
-_stream_edge.StreamEdge._on_track_published = _patched_on_track_published
-# ──────────────────────────────────────────────────────────────────────────────
-
 # ── SDK monkey-patch: create_call ──────────────────────────────────────────────
 # The SDK's create_call passes data as a plain dict {"created_by_id": ...} which
 # the getstream REST client doesn't serialize the same way as a CallRequest
